@@ -1,0 +1,90 @@
+import ArgumentParser
+import Darwin
+
+@main
+struct CLI: AsyncParsableCommand {
+    /// Single source of truth for the CLI's semver. Surfaced via ArgumentParser's
+    /// `--version` and reported as `app_ver` to telemetry so CLI sessions are
+    /// distinguishable from synthesized Bundle.main values (the bare executable
+    /// has no Info.plist and macOS otherwise reports an SDK marker like "16.0").
+    /// Bump in lockstep with `Sources/CLI/CHANGELOG.md`.
+    static let cliVersion = "3.0.0"
+
+    static let configuration = CommandConfiguration(
+        commandName: "macparakeet-cli",
+        abstract:
+            "Local STT, transcription, and prompt automation for Apple Silicon. Powered by Parakeet TDT, with optional Nemotron Beta, Cohere, and Whisper recognition.",
+        version: cliVersion,
+        subcommands: [
+            TranscribeCommand.self,
+            RetranscribeCommand.self,
+            SearchCommand.self,
+            SearchReindexCommand.self,
+            TranscriptCommand.self,
+            CardsCommand.self,
+            HistoryCommand.self,
+            ExportCommand.self,
+            StatsCommand.self,
+            SpecCommand.self,
+            HealthCommand.self,
+            ConfigCommand.self,
+            ModelsCommand.self,
+            VocabCommand.self,
+            LLMCommand.self,
+            PromptsCommand.self,
+            QuickPromptsCommand.self,
+            TransformsCommand.self,
+            MeetingsCommand.self,
+            CalendarCommand.self,
+            MeetingVADSimCommand.self,
+            FeedbackCommand.self,
+        ],
+        defaultSubcommand: nil
+    )
+
+    static func main() async {
+        await main(nil)
+    }
+
+    static func main(_ arguments: [String]?) async {
+        do {
+            var command = try parseAsRoot(arguments)
+            try await CLITelemetry.runInstrumented(&command)
+        } catch {
+            exitWithNormalizedError(error)
+        }
+    }
+
+    static func normalizedExitCode(for error: Error) -> ExitCode {
+        if let jsonExit = error as? CLIJSONEnvelopeExit {
+            return jsonExit.exitCode
+        }
+        if let exitCode = error as? ExitCode {
+            return normalizedExitCode(for: exitCode)
+        }
+        if isCLIValidationMisuse(error) {
+            return cliValidationMisuseExitCode
+        }
+        return normalizedExitCode(for: exitCode(for: error))
+    }
+
+    static func normalizedExitCode(for exitCode: ExitCode) -> ExitCode {
+        exitCode == .validationFailure ? cliValidationMisuseExitCode : exitCode
+    }
+
+    private static func exitWithNormalizedError(_ error: Error) -> Never {
+        let exitCode = normalizedExitCode(for: error)
+        if error is CLIJSONEnvelopeExit {
+            Darwin.exit(exitCode.rawValue)
+        }
+        let message = fullMessage(for: error)
+        if !message.isEmpty {
+            if exitCode.isSuccess {
+                print(message)
+            } else {
+                printErr(message)
+            }
+        }
+        Darwin.exit(exitCode.rawValue)
+    }
+}

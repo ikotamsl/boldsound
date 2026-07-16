@@ -1,0 +1,162 @@
+import FluidAudio
+import Foundation
+
+/// Standalone STT facade for the CLI tool and test helpers.
+///
+/// - Warning: Each ``STTClient`` creates its **own** `STTRuntime` and `STTScheduler`,
+///   bypassing the process-wide singleton that ADR-016 requires.
+///   **App code must never instantiate this type directly.**
+///   Use the shared ``STTScheduler`` from `AppEnvironment` instead.
+public actor STTClient: STTManaging, STTDictationPreviewTranscribing, SpeechEngineRoutedTranscribing, SpeechEngineSwitching, SpeechEngineSwitchAvailabilityProviding, SpeechEngineSessionManaging, SpeechEngineRoutedWarmUpManaging {
+    private let scheduler: STTScheduler
+
+    public init(
+        parakeetModelVariant: ParakeetModelVariant = .v3,
+        speechEngine: SpeechEnginePreference = .parakeet,
+        nemotronModelVariant: NemotronModelVariant = SpeechEnginePreference.defaultNemotronModelVariant,
+        whisperModelVariant: String = SpeechEnginePreference.defaultWhisperModelVariant,
+        defaults: UserDefaults = .standard,
+        customWordRepository: (any CustomWordRepositoryProtocol)? = nil,
+        customVocabularyRescorer: (any CustomVocabularyRescoring)? = nil,
+        customVocabularyRecognitionBoostingEnabled: (@Sendable () -> Bool)? = nil
+    ) {
+        let customVocabularyProvider = customWordRepository.map {
+            RepositoryCustomVocabularyBoostingTermProvider(repository: $0)
+        }
+        let runtimePreferences = UserDefaultsAppRuntimePreferences(defaults: defaults)
+        let recognitionBoostingEnabled = customVocabularyRecognitionBoostingEnabled ?? {
+            runtimePreferences.customVocabularyRecognitionBoostingEnabled
+        }
+        let runtime = STTRuntime(
+            parakeetModelVariant: parakeetModelVariant,
+            speechEngine: speechEngine,
+            nemotronModelVariant: nemotronModelVariant,
+            whisperModelVariant: whisperModelVariant,
+            defaults: defaults,
+            customVocabularyProvider: customVocabularyProvider,
+            customVocabularyRescorer: customVocabularyRescorer,
+            customVocabularyRecognitionBoostingEnabled: recognitionBoostingEnabled
+        )
+        self.scheduler = STTScheduler(runtime: runtime)
+    }
+
+    public func transcribe(
+        audioPath: String,
+        job: STTJobKind,
+        onProgress: (@Sendable (Int, Int) -> Void)?
+    ) async throws -> STTResult {
+        try await scheduler.transcribe(audioPath: audioPath, job: job, onProgress: onProgress)
+    }
+
+    public func transcribe(
+        audioPath: String,
+        job: STTJobKind,
+        speechEngine: SpeechEngineSelection,
+        onProgress: (@Sendable (Int, Int) -> Void)?
+    ) async throws -> STTResult {
+        try await scheduler.transcribe(
+            audioPath: audioPath,
+            job: job,
+            speechEngine: speechEngine,
+            onProgress: onProgress
+        )
+    }
+
+    public func transcribeDictationPreview(
+        samples: [Float],
+        speechEngine: SpeechEngineSelection
+    ) async throws -> STTResult {
+        try await scheduler.transcribeDictationPreview(samples: samples, speechEngine: speechEngine)
+    }
+
+    public func cancelDictationPreview() async {
+        await scheduler.cancelDictationPreview()
+    }
+
+    public func warmUp(onProgress: (@Sendable (String) -> Void)?) async throws {
+        try await scheduler.warmUp(onProgress: onProgress)
+    }
+
+    public func warmUp(
+        speechEngine: SpeechEngineSelection,
+        onProgress: (@Sendable (String) -> Void)?
+    ) async throws {
+        try await scheduler.warmUp(speechEngine: speechEngine, onProgress: onProgress)
+    }
+
+    public func backgroundWarmUp() async {
+        await scheduler.backgroundWarmUp()
+    }
+
+    public func observeWarmUpProgress() async -> (id: UUID, stream: AsyncStream<STTWarmUpState>) {
+        await scheduler.observeWarmUpProgress()
+    }
+
+    public func removeWarmUpObserver(id: UUID) async {
+        await scheduler.removeWarmUpObserver(id: id)
+    }
+
+    public func isReady() async -> Bool {
+        await scheduler.isReady()
+    }
+
+    public func isReady(speechEngine: SpeechEngineSelection) async -> Bool {
+        await scheduler.isReady(speechEngine: speechEngine)
+    }
+
+    public func clearModelCache() async {
+        await scheduler.clearModelCache()
+    }
+
+    public func shutdown() async {
+        await scheduler.shutdown()
+    }
+
+    public func setSpeechEngine(_ preference: SpeechEnginePreference) async throws {
+        try await scheduler.setSpeechEngine(preference)
+    }
+
+    public func setSpeechEngine(
+        _ preference: SpeechEnginePreference,
+        onProgress: (@Sendable (String) -> Void)?
+    ) async throws {
+        try await scheduler.setSpeechEngine(preference, onProgress: onProgress)
+    }
+
+    public func setParakeetModelVariant(
+        _ variant: ParakeetModelVariant,
+        onProgress: (@Sendable (String) -> Void)?
+    ) async throws {
+        try await scheduler.setParakeetModelVariant(variant, onProgress: onProgress)
+    }
+
+    public func setNemotronModelVariant(
+        _ variant: NemotronModelVariant,
+        onProgress: (@Sendable (String) -> Void)?
+    ) async throws {
+        try await scheduler.setNemotronModelVariant(variant, onProgress: onProgress)
+    }
+
+    public func engineSwitchAvailability() async -> SpeechEngineSwitchAvailability {
+        await scheduler.engineSwitchAvailability()
+    }
+
+    public func beginSpeechEngineSession() async -> SpeechEngineLease {
+        await scheduler.beginSpeechEngineSession()
+    }
+
+    public func endSpeechEngineSession(_ lease: SpeechEngineLease) async {
+        await scheduler.endSpeechEngineSession(lease)
+    }
+
+    public nonisolated static func isModelCached(version: AsrModelVersion = .v3) -> Bool {
+        STTRuntime.isModelCached(version: version)
+    }
+
+    public nonisolated static func isNemotronModelCached(
+        modelVariant: NemotronModelVariant = SpeechEnginePreference.defaultNemotronModelVariant,
+        language: String? = nil
+    ) -> Bool {
+        STTRuntime.isNemotronModelCached(modelVariant: modelVariant, language: language)
+    }
+}

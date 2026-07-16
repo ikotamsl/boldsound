@@ -1,0 +1,179 @@
+import XCTest
+@testable import MacParakeetCore
+
+final class AudioFileConverterTests: XCTestCase {
+
+    func testSupportedAudioExtensions() {
+        XCTAssertTrue(AudioFileConverter.isSupported(extension: "mp3"))
+        XCTAssertTrue(AudioFileConverter.isSupported(extension: "wav"))
+        XCTAssertTrue(AudioFileConverter.isSupported(extension: "m4a"))
+        XCTAssertTrue(AudioFileConverter.isSupported(extension: "flac"))
+        XCTAssertTrue(AudioFileConverter.isSupported(extension: "ogg"))
+        XCTAssertTrue(AudioFileConverter.isSupported(extension: "opus"))
+    }
+
+    func testSupportedVideoExtensions() {
+        XCTAssertTrue(AudioFileConverter.isSupported(extension: "mp4"))
+        XCTAssertTrue(AudioFileConverter.isSupported(extension: "mov"))
+        XCTAssertTrue(AudioFileConverter.isSupported(extension: "mkv"))
+        XCTAssertTrue(AudioFileConverter.isSupported(extension: "webm"))
+        XCTAssertTrue(AudioFileConverter.isSupported(extension: "avi"))
+    }
+
+    func testUnsupportedExtensions() {
+        XCTAssertFalse(AudioFileConverter.isSupported(extension: "txt"))
+        XCTAssertFalse(AudioFileConverter.isSupported(extension: "pdf"))
+        XCTAssertFalse(AudioFileConverter.isSupported(extension: "doc"))
+        XCTAssertFalse(AudioFileConverter.isSupported(extension: "jpg"))
+    }
+
+    func testCaseInsensitiveExtension() {
+        XCTAssertTrue(AudioFileConverter.isSupported(extension: "MP3"))
+        XCTAssertTrue(AudioFileConverter.isSupported(extension: "WAV"))
+        XCTAssertTrue(AudioFileConverter.isSupported(extension: "Mp4"))
+    }
+
+    func testFFmpegArguments() {
+        let converter = AudioFileConverter()
+        let args = converter.ffmpegArguments(inputPath: "/tmp/input.mp3", outputPath: "/tmp/output.wav")
+
+        XCTAssertTrue(args.contains("-i"))
+        XCTAssertTrue(args.contains("/tmp/input.mp3"))
+        XCTAssertTrue(args.contains("-ar"))
+        XCTAssertTrue(args.contains("16000"))
+        XCTAssertTrue(args.contains("-ac"))
+        XCTAssertTrue(args.contains("1"))
+        XCTAssertTrue(args.contains("-f"))
+        XCTAssertTrue(args.contains("wav"))
+        XCTAssertTrue(args.contains("-acodec"))
+        XCTAssertTrue(args.contains("pcm_f32le"))
+        XCTAssertTrue(args.contains("-y"))
+        XCTAssertTrue(args.contains("/tmp/output.wav"))
+    }
+
+    func testFFmpegMixArgumentsPreserveStereoForMicAndSystem() {
+        let converter = AudioFileConverter()
+        let args = converter.ffmpegMixArguments(
+            inputPaths: ["/tmp/mic.m4a", "/tmp/system-raw.m4a"],
+            outputPath: "/tmp/meeting-playback.m4a"
+        )
+
+        XCTAssertTrue(args.contains("-filter_complex"))
+        XCTAssertTrue(args.contains(
+            "[0:a]pan=stereo|c0=c0|c1=0*c0,adelay=0|0[a0];[1:a]pan=stereo|c0=0*c0|c1=c0,adelay=0|0[a1];[a0][a1]amix=inputs=2:duration=longest:normalize=0[a]"
+        ))
+        XCTAssertTrue(args.contains("-map"))
+        XCTAssertTrue(args.contains("[a]"))
+        XCTAssertTrue(args.contains("-ac"))
+        XCTAssertTrue(args.contains("2"))
+    }
+
+    func testFFmpegMixArgumentsApplySourceAlignmentDelays() {
+        let converter = AudioFileConverter()
+        let alignment = MeetingSourceAlignment(
+            meetingOriginHostTime: nil,
+            microphone: .init(
+                firstHostTime: nil,
+                lastHostTime: nil,
+                startOffsetMs: 0,
+                writtenFrameCount: 48_000,
+                sampleRate: 48_000
+            ),
+            system: .init(
+                firstHostTime: nil,
+                lastHostTime: nil,
+                startOffsetMs: 150,
+                writtenFrameCount: 48_000,
+                sampleRate: 48_000
+            )
+        )
+
+        let args = converter.ffmpegMixArguments(
+            inputPaths: ["/tmp/mic.m4a", "/tmp/system-raw.m4a"],
+            outputPath: "/tmp/meeting-playback.m4a",
+            sourceAlignment: alignment
+        )
+
+        XCTAssertTrue(args.contains("-filter_complex"))
+        XCTAssertTrue(args.contains(
+            "[0:a]pan=stereo|c0=c0|c1=0*c0,adelay=0|0[a0];[1:a]pan=stereo|c0=0*c0|c1=c0,adelay=150|150[a1];[a0][a1]amix=inputs=2:duration=longest:normalize=0[a]"
+        ))
+    }
+
+    func testFFmpegMixArgumentsKeepLongestDualSourceDuration() {
+        let converter = AudioFileConverter()
+        let args = converter.ffmpegMixArguments(
+            inputPaths: ["/tmp/mic.m4a", "/tmp/system-raw.m4a"],
+            outputPath: "/tmp/meeting-playback.m4a"
+        )
+
+        guard let filterFlagIndex = args.firstIndex(of: "-filter_complex") else {
+            return XCTFail("Missing -filter_complex in ffmpeg mix args")
+        }
+        guard args.indices.contains(filterFlagIndex + 1) else {
+            return XCTFail("Missing -filter_complex value")
+        }
+
+        let filterArg = args[filterFlagIndex + 1]
+        XCTAssertTrue(filterArg.contains("duration=longest"))
+        XCTAssertTrue(filterArg.contains("normalize=0"))
+    }
+
+    func testTailForErrorKeepsFailureReasonFromEnd() {
+        let stderr = """
+        ffmpeg version 8.1 Copyright ...
+          configuration: --prefix=/opt/homebrew --enable-libx264 --enable-libx265
+        Input #0, mov,mp4,m4a,3gp,3g2,mj2, from '/tmp/input.mp4':
+        Error opening input file /tmp/input.mp4.
+        Error opening input files: No such file or directory
+        """
+
+        let tail = AudioFileConverter.tailForError(stderr, limit: 90)
+
+        XCTAssertTrue(tail.hasPrefix("..."))
+        XCTAssertTrue(tail.contains("Error opening input files"))
+        XCTAssertTrue(tail.contains("No such file or directory"))
+        XCTAssertFalse(tail.contains("ffmpeg version"))
+    }
+
+    func testTailForErrorTrimsWithoutLosingErrorBeforeTrailingWhitespace() {
+        let stderr = "ffmpeg banner\nactual failure reason" + String(repeating: "\n ", count: 100)
+
+        let tail = AudioFileConverter.tailForError(stderr, limit: 64)
+
+        XCTAssertEqual(tail, "ffmpeg banner\nactual failure reason")
+    }
+
+    func testTailForErrorEmptyInputUsesUnknownError() {
+        XCTAssertEqual(AudioFileConverter.tailForError(" \n\t "), "Unknown error")
+        XCTAssertEqual(AudioFileConverter.tailForError("actual error", limit: 0), "Unknown error")
+    }
+
+    func testConvertUnsupportedFormat() async {
+        let converter = AudioFileConverter()
+        let url = URL(fileURLWithPath: "/tmp/test.txt")
+
+        do {
+            _ = try await converter.convert(fileURL: url)
+            XCTFail("Should have thrown for unsupported format")
+        } catch let error as AudioProcessorError {
+            if case .unsupportedFormat(let ext) = error {
+                XCTAssertEqual(ext, "txt")
+            } else {
+                XCTFail("Wrong error type: \(error)")
+            }
+        } catch {
+            XCTFail("Wrong error type: \(error)")
+        }
+    }
+
+    func testAudioProcessorErrorDescriptions() {
+        XCTAssertNotNil(AudioProcessorError.microphonePermissionDenied.errorDescription)
+        XCTAssertNotNil(AudioProcessorError.microphoneNotAvailable.errorDescription)
+        XCTAssertNotNil(AudioProcessorError.recordingFailed("test").errorDescription)
+        XCTAssertNotNil(AudioProcessorError.conversionFailed("test").errorDescription)
+        XCTAssertNotNil(AudioProcessorError.unsupportedFormat("xyz").errorDescription)
+        XCTAssertNotNil(AudioProcessorError.fileTooLarge("test").errorDescription)
+        XCTAssertNotNil(AudioProcessorError.insufficientSamples.errorDescription)
+    }
+}

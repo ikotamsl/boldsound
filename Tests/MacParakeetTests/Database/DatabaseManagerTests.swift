@@ -1,0 +1,1568 @@
+import XCTest
+import GRDB
+@testable import MacParakeetCore
+
+final class DatabaseManagerTests: XCTestCase {
+    private let prePromptLibraryMigrationIDs = [
+        "v0.1-dictations",
+        "v0.1-transcriptions",
+        "v0.2-custom-words",
+        "v0.2-text-snippets",
+        "v0.3-transcription-source-url",
+        "v0.4-transcription-diarization-segments",
+        "v0.4-transcription-llm-content",
+        "v0.5-private-dictation",
+        "v0.5-chat-conversations",
+        "v0.5-drop-unused-fts",
+        "v0.5-transcription-video-metadata",
+        "v0.6-transcription-source-type",
+        "v0.7-snippet-key-action",
+    ]
+
+    func testInMemoryDatabaseCreates() throws {
+        let manager = try DatabaseManager()
+        XCTAssertNotNil(manager.dbQueue)
+    }
+
+    func testAIFormatterProfilesMigrationCreatesTableAndDictationMetadataColumns() throws {
+        let manager = try DatabaseManager()
+
+        try manager.dbQueue.read { db in
+            XCTAssertTrue(try db.tableExists("ai_formatter_profiles"))
+
+            let profileColumns = try db.columns(in: "ai_formatter_profiles").map(\.name)
+            XCTAssertTrue(profileColumns.contains("targetKind"))
+            XCTAssertTrue(profileColumns.contains("bundleIdentifier"))
+            XCTAssertTrue(profileColumns.contains("appCategory"))
+            XCTAssertTrue(profileColumns.contains("promptTemplate"))
+            XCTAssertTrue(profileColumns.contains("origin"))
+
+            let dictationColumns = try db.columns(in: "dictations").map(\.name)
+            XCTAssertTrue(dictationColumns.contains("aiFormatterProfileID"))
+            XCTAssertTrue(dictationColumns.contains("aiFormatterProfileName"))
+            XCTAssertTrue(dictationColumns.contains("aiFormatterProfileMatchKind"))
+        }
+    }
+
+    func testTranscriptSegmentsMigrationAddsTranscriptionColumn() throws {
+        let manager = try DatabaseManager()
+
+        try manager.dbQueue.read { db in
+            let columns = try db.columns(in: "transcriptions").map(\.name)
+            XCTAssertTrue(columns.contains("transcriptSegments"))
+        }
+    }
+
+    func testTitleOverrideMigrationAddsTranscriptionColumn() throws {
+        let manager = try DatabaseManager()
+
+        try manager.dbQueue.read { db in
+            let columns = try db.columns(in: "transcriptions").map(\.name)
+            XCTAssertTrue(columns.contains("titleOverride"))
+        }
+    }
+
+    func testSegmentsFTSMigrationCreatesExternalContentIndexAndTriggers() throws {
+        let manager = try DatabaseManager()
+        let transcription = Transcription(
+            fileName: "Tokenizer",
+            rawTranscript: "ộ",
+            status: .completed,
+            sourceType: .file
+        )
+        try TranscriptionRepository(dbQueue: manager.dbQueue).save(transcription)
+        try SegmentRepository(dbQueue: manager.dbQueue).replaceSegments(for: transcription)
+
+        try manager.dbQueue.read { db in
+            XCTAssertTrue(try db.tableExists("segments"))
+            XCTAssertTrue(try db.tableExists("segments_fts"))
+            XCTAssertTrue(try db.indexes(on: "segments").contains {
+                $0.name == "idx_segments_transcription"
+            })
+            let triggerNames = try String.fetchAll(
+                db,
+                sql: "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'segments'"
+            )
+            let actualTriggerNames: Set<String> = Set(triggerNames)
+            let expectedTriggerNames: Set<String> = ["segments_ai", "segments_ad", "segments_au"]
+            XCTAssertEqual(actualTriggerNames, expectedTriggerNames)
+            let matchedRows = try Int.fetchOne(
+                db,
+                sql: "SELECT count(*) FROM segments_fts WHERE segments_fts MATCH 'cafe'"
+            )
+            XCTAssertNotNil(matchedRows)
+        }
+        let repository = SegmentRepository(dbQueue: manager.dbQueue)
+        let query = SegmentSearchQuery(query: "o", limit: 1)
+        let hits: [SegmentSearchHit] = try repository.search(query)
+        XCTAssertEqual(
+            hits.first?.transcriptionId,
+            transcription.id,
+            "remove_diacritics 2 must fold a character with multiple diacritics"
+        )
+    }
+
+    func testSegmentsMigrationPreservesExistingTranscriptionRows() throws {
+        let dbPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("segments_existing_data_\(UUID().uuidString).db")
+            .path
+        defer { cleanupDatabaseFiles(atPath: dbPath) }
+
+        let first = try DatabaseManager(path: dbPath)
+        let transcription = Transcription(
+            fileName: "Legacy meeting",
+            rawTranscript: "Existing user data remains canonical.",
+            status: .completed,
+            sourceType: .meeting
+        )
+        try TranscriptionRepository(dbQueue: first.dbQueue).save(transcription)
+        try first.dbQueue.write { db in
+            try db.execute(sql: "DROP TABLE segments_fts")
+            try db.execute(sql: "DROP TABLE segments")
+            try db.execute(
+                sql: "DELETE FROM grdb_migrations WHERE identifier = ?",
+                arguments: ["v0.27-segments-fts"]
+            )
+        }
+
+        let migrated = try DatabaseManager(path: dbPath)
+        let fetched = try TranscriptionRepository(dbQueue: migrated.dbQueue).fetch(id: transcription.id)
+        XCTAssertEqual(fetched?.rawTranscript, transcription.rawTranscript)
+        try migrated.dbQueue.read { db in
+            XCTAssertTrue(try db.tableExists("segments"))
+            XCTAssertTrue(try db.tableExists("segments_fts"))
+            XCTAssertEqual(try Segment.fetchCount(db), 0, "migration must not perform a blocking backfill")
+        }
+    }
+
+    func testCardsMigrationCreatesTableFTSAndTriggers() throws {
+        let manager = try DatabaseManager()
+
+        try manager.dbQueue.read { db in
+            XCTAssertTrue(try db.tableExists("cards"))
+            XCTAssertTrue(try db.tableExists("cards_fts"))
+            XCTAssertTrue(try db.tableExists("cards_search_content"))
+            XCTAssertEqual(
+                Set(try db.columns(in: "cards").map(\.name)),
+                [
+                    "transcriptionId", "cardSchemaVersion", "transcriptHash",
+                    "segmenterVersion", "promptVersion", "model", "generatedAt",
+                    "synopsis", "topics", "decisions", "actions",
+                ]
+            )
+            let triggers = Set(
+                try String.fetchAll(
+                    db,
+                    sql: "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'cards'"
+                )
+            )
+            XCTAssertEqual(triggers, ["cards_ai", "cards_ad", "cards_au"])
+        }
+    }
+
+    func testCardsMigrationPreservesExistingTranscriptionRows() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+        let dbPath = tempDir.appendingPathComponent("cards_migration_\(UUID().uuidString).db").path
+        defer { cleanupDatabaseFiles(atPath: dbPath) }
+
+        let transcription = Transcription(
+            fileName: "Existing meeting",
+            rawTranscript: "Keep this transcript",
+            status: .completed,
+            sourceType: .meeting
+        )
+        let manager1 = try DatabaseManager(path: dbPath)
+        try TranscriptionRepository(dbQueue: manager1.dbQueue).save(transcription)
+        try manager1.dbQueue.write { db in
+            try db.execute(sql: "DROP TABLE cards_fts")
+            try db.execute(sql: "DROP TABLE cards_search_content")
+            try db.execute(sql: "DROP TABLE cards")
+            try db.execute(
+                sql: "DELETE FROM grdb_migrations WHERE identifier = ?",
+                arguments: ["v0.28-cards"]
+            )
+        }
+
+        let manager2 = try DatabaseManager(path: dbPath)
+        let preserved = try TranscriptionRepository(dbQueue: manager2.dbQueue).fetch(id: transcription.id)
+        XCTAssertEqual(preserved?.rawTranscript, "Keep this transcript")
+        XCTAssertTrue(try manager2.dbQueue.read { try $0.tableExists("cards") })
+        XCTAssertEqual(try manager2.dbQueue.read { try Card.fetchCount($0) }, 0)
+    }
+
+    func testPostV027MaintenanceRebuildsPersistedVersionOneSegmentsPerRecording() throws {
+        let dbPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cards_v027_segment_maintenance_\(UUID().uuidString).db")
+            .path
+        defer { cleanupDatabaseFiles(atPath: dbPath) }
+
+        let original = try DatabaseManager(path: dbPath)
+        let transcription = Transcription(
+            fileName: "Installed recording",
+            rawTranscript: "Current deterministic transcript.",
+            status: .completed,
+            sourceType: .file
+        )
+        try TranscriptionRepository(dbQueue: original.dbQueue).save(transcription)
+        try original.dbQueue.write { db in
+            var legacy = Segment(
+                transcriptionId: transcription.id,
+                seq: 0,
+                startMs: nil,
+                endMs: nil,
+                speaker: nil,
+                text: "Legacy version one text.",
+                segmenterVersion: 1
+            )
+            try legacy.insert(db)
+            try db.execute(sql: "DROP TABLE cards_fts")
+            try db.execute(sql: "DROP TABLE cards_search_content")
+            try db.execute(sql: "DROP TABLE cards")
+            try db.execute(
+                sql: "DELETE FROM grdb_migrations WHERE identifier = ?",
+                arguments: ["v0.28-cards"]
+            )
+        }
+
+        let migrated = try DatabaseManager(path: dbPath)
+        let repository = SegmentRepository(dbQueue: migrated.dbQueue)
+        XCTAssertEqual(
+            try repository.fetch(transcriptionId: transcription.id).map(\.segmenterVersion),
+            [1],
+            "the schema migration itself must remain non-blocking"
+        )
+
+        let result = try repository.rebuildOutdated()
+
+        XCTAssertEqual(result.transcriptionsIndexed, 1)
+        XCTAssertEqual(
+            try repository.fetch(transcriptionId: transcription.id).map(\.segmenterVersion),
+            [KnowledgeSegmenter.currentVersion]
+        )
+        XCTAssertEqual(
+            try repository.fetch(transcriptionId: transcription.id).map(\.text),
+            ["Current deterministic transcript."]
+        )
+    }
+
+    func testFileBackedConnectionsWaitForShortWriteLock() throws {
+        let dbPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("macparakeet-lock-wait-\(UUID().uuidString).db")
+            .path
+        defer { cleanupDatabaseFiles(atPath: dbPath) }
+
+        let first = try DatabaseManager(path: dbPath)
+        let second = try DatabaseManager(path: dbPath)
+        let lockAcquired = DispatchSemaphore(value: 0)
+        let releaseLock = DispatchSemaphore(value: 0)
+        let firstFinished = expectation(description: "first write finishes")
+        let secondFinished = expectation(description: "second write finishes")
+        let resultLock = NSLock()
+        var firstError: Error?
+        var secondError: Error?
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try first.dbQueue.write { db in
+                    try db.execute(sql: "SELECT 1")
+                    lockAcquired.signal()
+                    _ = releaseLock.wait(timeout: .now() + 2)
+                }
+            } catch {
+                resultLock.lock()
+                firstError = error
+                resultLock.unlock()
+            }
+            firstFinished.fulfill()
+        }
+
+        XCTAssertEqual(lockAcquired.wait(timeout: .now() + 1), .success)
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try second.dbQueue.write { db in
+                    try db.execute(sql: "SELECT 1")
+                }
+            } catch {
+                resultLock.lock()
+                secondError = error
+                resultLock.unlock()
+            }
+            secondFinished.fulfill()
+        }
+
+        Thread.sleep(forTimeInterval: 0.1)
+        releaseLock.signal()
+
+        wait(for: [firstFinished, secondFinished], timeout: 3)
+        resultLock.lock()
+        let capturedFirstError = firstError
+        let capturedSecondError = secondError
+        resultLock.unlock()
+
+        XCTAssertNil(capturedFirstError)
+        XCTAssertNil(capturedSecondError)
+    }
+
+    func testConcurrentFileBackedManagersSerializeInitialMigration() throws {
+        let dbPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("macparakeet-concurrent-migration-\(UUID().uuidString).db")
+            .path
+        defer { cleanupDatabaseFiles(atPath: dbPath) }
+
+        let start = DispatchSemaphore(value: 0)
+        let finished = DispatchGroup()
+        let resultLock = NSLock()
+        var errors: [Error] = []
+
+        for _ in 0..<4 {
+            finished.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                start.wait()
+                do {
+                    let manager = try DatabaseManager(path: dbPath)
+                    try manager.dbQueue.read { db in
+                        XCTAssertTrue(try db.tableExists("dictations"))
+                        XCTAssertTrue(try db.tableExists("transcriptions"))
+                        XCTAssertTrue(try db.tableExists("quick_prompts"))
+                    }
+                } catch {
+                    resultLock.lock()
+                    errors.append(error)
+                    resultLock.unlock()
+                }
+                finished.leave()
+            }
+        }
+
+        for _ in 0..<4 {
+            start.signal()
+        }
+
+        XCTAssertEqual(finished.wait(timeout: .now() + 5), .success)
+        resultLock.lock()
+        let capturedErrors = errors
+        resultLock.unlock()
+        XCTAssertTrue(capturedErrors.isEmpty, "Unexpected migration errors: \(capturedErrors)")
+    }
+
+    func testMigrationsCreateTables() throws {
+        let manager = try DatabaseManager()
+        try manager.dbQueue.read { db in
+            XCTAssertTrue(try db.tableExists("dictations"))
+            XCTAssertTrue(try db.tableExists("transcriptions"))
+            XCTAssertTrue(try db.tableExists("prompts"))
+            XCTAssertTrue(try db.tableExists("summaries"))
+            // dictations_fts was dropped in v0.5-drop-unused-fts (never queried, wasted write overhead)
+            XCTAssertFalse(try db.tableExists("dictations_fts"))
+        }
+    }
+
+    func testMigrationsCreateIndexes() throws {
+        let manager = try DatabaseManager()
+        try manager.dbQueue.read { db in
+            let dictationIndexes = try db.indexes(on: "dictations")
+            XCTAssertTrue(dictationIndexes.contains { $0.name == "idx_dictations_created_at" })
+
+            let transcriptionIndexes = try db.indexes(on: "transcriptions")
+            XCTAssertTrue(transcriptionIndexes.contains { $0.name == "idx_transcriptions_created_at" })
+            XCTAssertTrue(transcriptionIndexes.contains { $0.name == "idx_transcriptions_source_type_created_at" })
+            XCTAssertTrue(transcriptionIndexes.contains { $0.name == "idx_transcriptions_favorite_created_at" })
+            XCTAssertTrue(transcriptionIndexes.contains { $0.name == "idx_transcriptions_status_created_at" })
+
+            let promptIndexes = try db.indexes(on: "prompts")
+            XCTAssertTrue(promptIndexes.contains { $0.name == "idx_prompts_name" })
+
+            let summaryIndexes = try db.indexes(on: "summaries")
+            XCTAssertTrue(summaryIndexes.contains { $0.name == "idx_summaries_transcription_id" })
+        }
+    }
+
+    func testSourceURLColumnExists() throws {
+        let manager = try DatabaseManager()
+        try manager.dbQueue.read { db in
+            let columns = try db.columns(in: "transcriptions")
+            let columnNames = columns.map(\.name)
+            XCTAssertTrue(columnNames.contains("sourceURL"), "transcriptions should have sourceURL column")
+        }
+    }
+
+    func testVideoMetadataColumnsExist() throws {
+        let manager = try DatabaseManager()
+        try manager.dbQueue.read { db in
+            let columns = try db.columns(in: "transcriptions").map(\.name)
+            XCTAssertTrue(columns.contains("thumbnailURL"), "transcriptions should have thumbnailURL column")
+            XCTAssertTrue(columns.contains("channelName"), "transcriptions should have channelName column")
+            XCTAssertTrue(columns.contains("videoDescription"), "transcriptions should have videoDescription column")
+            XCTAssertTrue(columns.contains("isFavorite"), "transcriptions should have isFavorite column")
+            XCTAssertTrue(columns.contains("sourceType"), "transcriptions should have sourceType column")
+            XCTAssertTrue(columns.contains("recoveredFromCrash"), "transcriptions should have recoveredFromCrash column")
+        }
+    }
+
+    // MARK: - ADR-020 v0.8 schema additions
+
+    func testUserNotesColumnExistsOnTranscriptions() throws {
+        let manager = try DatabaseManager()
+        try manager.dbQueue.read { db in
+            let columns = try db.columns(in: "transcriptions").map(\.name)
+            XCTAssertTrue(columns.contains("userNotes"), "transcriptions should have userNotes column (ADR-020 §3)")
+        }
+    }
+
+    func testMeetingArtifactFolderPathColumnExistsOnTranscriptions() throws {
+        let manager = try DatabaseManager()
+        try manager.dbQueue.read { db in
+            let columns = try db.columns(in: "transcriptions").map(\.name)
+            XCTAssertTrue(
+                columns.contains("meetingArtifactFolderPath"),
+                "transcriptions should preserve meeting artifact folder identity after audio retention"
+            )
+        }
+    }
+
+    func testMeetingStartContextColumnExistsOnTranscriptions() throws {
+        let manager = try DatabaseManager()
+        try manager.dbQueue.read { db in
+            let columns = try db.columns(in: "transcriptions").map(\.name)
+            XCTAssertTrue(
+                columns.contains("meetingStartContext"),
+                "transcriptions should store one-shot meeting start context JSON"
+            )
+        }
+    }
+
+    func testCalendarEventSnapshotColumnExistsOnTranscriptions() throws {
+        let manager = try DatabaseManager()
+        try manager.dbQueue.read { db in
+            let columns = try db.columns(in: "transcriptions").map(\.name)
+            XCTAssertTrue(
+                columns.contains("calendarEventSnapshot"),
+                "transcriptions should preserve local calendar context captured at meeting start"
+            )
+        }
+    }
+
+    func testMeetingStartContextMigrationToleratesExistingColumnWhenMigrationMarkerIsMissing() throws {
+        let dbPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("meeting_start_context_rerun_\(UUID().uuidString).db")
+            .path
+        defer { cleanupDatabaseFiles(atPath: dbPath) }
+
+        let manager1 = try DatabaseManager(path: dbPath)
+        try manager1.dbQueue.write { db in
+            try db.execute(
+                sql: "DELETE FROM grdb_migrations WHERE identifier = ?",
+                arguments: ["v0.24-meeting-start-context"]
+            )
+        }
+
+        let manager2 = try DatabaseManager(path: dbPath)
+        try manager2.dbQueue.read { db in
+            let columns = try db.columns(in: "transcriptions").map(\.name)
+            XCTAssertTrue(columns.contains("meetingStartContext"))
+
+            let migrationRecorded = try Bool.fetchOne(
+                db,
+                sql: "SELECT EXISTS(SELECT 1 FROM grdb_migrations WHERE identifier = ?)",
+                arguments: ["v0.24-meeting-start-context"]
+            ) ?? false
+            XCTAssertTrue(migrationRecorded)
+        }
+    }
+
+    func testCalendarEventSnapshotMigrationToleratesExistingColumnWhenMigrationMarkerIsMissing() throws {
+        let dbPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("calendar_event_snapshot_rerun_\(UUID().uuidString).db")
+            .path
+        defer { cleanupDatabaseFiles(atPath: dbPath) }
+
+        let manager1 = try DatabaseManager(path: dbPath)
+        try manager1.dbQueue.write { db in
+            try db.execute(
+                sql: "DELETE FROM grdb_migrations WHERE identifier = ?",
+                arguments: ["v0.25-meeting-calendar-event-snapshot"]
+            )
+        }
+
+        let manager2 = try DatabaseManager(path: dbPath)
+        try manager2.dbQueue.read { db in
+            let columns = try db.columns(in: "transcriptions").map(\.name)
+            XCTAssertTrue(columns.contains("calendarEventSnapshot"))
+
+            let migrationRecorded = try Bool.fetchOne(
+                db,
+                sql: "SELECT EXISTS(SELECT 1 FROM grdb_migrations WHERE identifier = ?)",
+                arguments: ["v0.25-meeting-calendar-event-snapshot"]
+            ) ?? false
+            XCTAssertTrue(migrationRecorded)
+        }
+    }
+
+    func testUserNotesSnapshotColumnExistsOnSummaries() throws {
+        let manager = try DatabaseManager()
+        try manager.dbQueue.read { db in
+            let columns = try db.columns(in: "summaries").map(\.name)
+            XCTAssertTrue(columns.contains("userNotesSnapshot"), "summaries should have userNotesSnapshot column (ADR-020 §6)")
+        }
+    }
+
+    func testTranscriptionUserNotesRoundTrips() throws {
+        let manager = try DatabaseManager()
+        let transcriptionID = UUID()
+
+        let transcription = Transcription(
+            id: transcriptionID,
+            fileName: "meeting-playback.m4a",
+            sourceType: .meeting,
+            userNotes: "key decision: ship Friday\nfollow up with QA"
+        )
+        try manager.dbQueue.write { db in
+            try transcription.insert(db)
+        }
+
+        let loaded = try manager.dbQueue.read { db in
+            try Transcription.fetchOne(db, key: transcriptionID)
+        }
+        XCTAssertEqual(loaded?.userNotes, "key decision: ship Friday\nfollow up with QA")
+    }
+
+    func testTranscriptionUserNotesNilByDefault() throws {
+        let manager = try DatabaseManager()
+        let transcriptionID = UUID()
+
+        let transcription = Transcription(id: transcriptionID, fileName: "no-notes.m4a")
+        try manager.dbQueue.write { db in
+            try transcription.insert(db)
+        }
+
+        let loaded = try manager.dbQueue.read { db in
+            try Transcription.fetchOne(db, key: transcriptionID)
+        }
+        XCTAssertNil(loaded?.userNotes)
+    }
+
+    func testPromptResultUserNotesSnapshotRoundTrips() throws {
+        let manager = try DatabaseManager()
+        let transcriptionID = UUID()
+        let promptResultID = UUID()
+
+        try manager.dbQueue.write { db in
+            try Transcription(id: transcriptionID, fileName: "fixture.m4a").insert(db)
+            try PromptResult(
+                id: promptResultID,
+                transcriptionId: transcriptionID,
+                promptName: "Summary",
+                promptContent: "...",
+                content: "Generated summary",
+                userNotesSnapshot: "snapshot of notes at gen time"
+            ).insert(db)
+        }
+
+        let loaded = try manager.dbQueue.read { db in
+            try PromptResult.fetchOne(db, key: promptResultID)
+        }
+        XCTAssertEqual(loaded?.userNotesSnapshot, "snapshot of notes at gen time")
+    }
+
+    func testReconcileBuiltInPromptsHonorsAutoRunGuardWhenZeroAutoRun() throws {
+        // Seed a v0.7-shaped database where the user has explicitly disabled
+        // every auto-run prompt (a valid state per ADR-013). Then run the
+        // current migrator: any built-in whose canonical isAutoRun is `true`
+        // (e.g. "Summary") must be inserted with isAutoRun=false to preserve
+        // the user's choice.
+        let tempDir = FileManager.default.temporaryDirectory
+        let dbPath = tempDir.appendingPathComponent("autorun_guard_zero_\(UUID().uuidString).db").path
+
+        let seedQueue = try DatabaseQueue(path: dbPath)
+        try seedQueue.write { db in
+            try db.execute(sql: """
+                CREATE TABLE grdb_migrations (
+                    identifier TEXT NOT NULL PRIMARY KEY
+                )
+            """)
+            for migrationID in prePromptLibraryMigrationIDs {
+                try db.execute(
+                    sql: "INSERT INTO grdb_migrations (identifier) VALUES (?)",
+                    arguments: [migrationID]
+                )
+            }
+            try db.execute(sql: """
+                CREATE TABLE text_snippets (
+                    id TEXT PRIMARY KEY,
+                    trigger TEXT NOT NULL,
+                    expansion TEXT NOT NULL,
+                    isEnabled INTEGER NOT NULL DEFAULT 1,
+                    useCount INTEGER NOT NULL DEFAULT 0,
+                    createdAt TEXT NOT NULL,
+                    updatedAt TEXT NOT NULL,
+                    action TEXT
+                )
+            """)
+            try db.execute(sql: """
+                CREATE TABLE transcriptions (
+                    id TEXT PRIMARY KEY,
+                    createdAt TEXT NOT NULL,
+                    fileName TEXT NOT NULL,
+                    filePath TEXT,
+                    fileSizeBytes INTEGER,
+                    durationMs INTEGER,
+                    rawTranscript TEXT,
+                    cleanTranscript TEXT,
+                    wordTimestamps TEXT,
+                    language TEXT DEFAULT 'en',
+                    speakerCount INTEGER,
+                    speakers TEXT,
+                    status TEXT NOT NULL DEFAULT 'processing',
+                    errorMessage TEXT,
+                    exportPath TEXT,
+                    updatedAt TEXT NOT NULL,
+                    sourceURL TEXT,
+                    diarizationSegments TEXT,
+                    summary TEXT,
+                    chatMessages TEXT,
+                    thumbnailURL TEXT,
+                    channelName TEXT,
+                    videoDescription TEXT,
+                    isFavorite INTEGER NOT NULL DEFAULT 0,
+                    sourceType TEXT NOT NULL DEFAULT 'file'
+                )
+            """)
+            try Self.createV05DictationsTable(db: db)
+            try Self.createV05ChatConversationsTable(db: db)
+            // Pre-seed prompts table with all auto-run flags off — simulating
+            // a user who has explicitly disabled every auto-run prompt.
+            try db.execute(sql: """
+                CREATE TABLE prompts (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT 'summary',
+                    isBuiltIn INTEGER NOT NULL DEFAULT 0,
+                    isVisible INTEGER NOT NULL DEFAULT 1,
+                    isAutoRun INTEGER NOT NULL DEFAULT 0,
+                    sortOrder INTEGER NOT NULL DEFAULT 0,
+                    createdAt TEXT NOT NULL,
+                    updatedAt TEXT NOT NULL
+                )
+            """)
+            try db.execute(sql: """
+                CREATE UNIQUE INDEX idx_prompts_name ON prompts(name COLLATE NOCASE)
+            """)
+            try db.execute(sql: """
+                CREATE TABLE summaries (
+                    id TEXT PRIMARY KEY,
+                    transcriptionId TEXT NOT NULL REFERENCES transcriptions(id) ON DELETE CASCADE,
+                    promptName TEXT NOT NULL,
+                    promptContent TEXT NOT NULL,
+                    extraInstructions TEXT,
+                    content TEXT NOT NULL,
+                    createdAt TEXT NOT NULL,
+                    updatedAt TEXT NOT NULL
+                )
+            """)
+            try db.execute(sql: """
+                CREATE INDEX idx_summaries_transcription_id ON summaries(transcriptionId)
+            """)
+            // Insert a single dummy prompt with isAutoRun = 0 so the table is
+            // non-empty but no row qualifies as auto-run. (The reconciler
+            // would NOT touch this row's isAutoRun on UPDATE.)
+            let now = Date()
+            try db.execute(
+                sql: "INSERT INTO prompts (id, name, content, category, isBuiltIn, isVisible, isAutoRun, sortOrder, createdAt, updatedAt) VALUES (?, ?, ?, ?, 0, 1, 0, 0, ?, ?)",
+                arguments: [UUID(), "User's Custom Prompt", "do stuff", "summary", now, now]
+            )
+            // Also mark the prior autorun-related migrations as already run
+            // so we don't re-trigger the v0.7.x auto-run setters on this seed.
+            for migrationID in [
+                "v0.7-prompts-and-summaries",
+                "v0.7.1-prompt-default",
+                "v0.7.2-prompt-autorun",
+                "v0.7.3-prompt-autorun-visibility",
+                "v0.7.4-lifetime-dictation-stats",
+                "v0.7.5-meeting-recovery-flag",
+            ] {
+                try db.execute(
+                    sql: "INSERT INTO grdb_migrations (identifier) VALUES (?)",
+                    arguments: [migrationID]
+                )
+            }
+        }
+
+        let manager = try DatabaseManager(path: dbPath)
+        try manager.dbQueue.read { db in
+            // "Summary" was inserted by reconcile (its canonical UUID wasn't
+            // in the DB before — the v0.7 migration was marked complete but
+            // skipped). Auto-run guard kicked in: no pre-existing auto-run
+            // row, so the new built-in must be inserted with auto-run disabled.
+            let row = try Row.fetchOne(
+                db,
+                sql: "SELECT isAutoRun FROM prompts WHERE name = 'Summary'"
+            )
+            XCTAssertNotNil(row, "Summary should have been inserted by reconcile")
+            let isAutoRun = (row?["isAutoRun"] as Int?) ?? 0
+            XCTAssertEqual(isAutoRun, 0, "Auto-run guard must preserve zero-auto-run state (ADR-020 §5)")
+        }
+
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    func testReconcileBuiltInPromptsHonorsAutoRunGuardWhenAtLeastOneAutoRun() throws {
+        // Same shape as the above test, but seed with one existing auto-run
+        // prompt. A new built-in whose canonical isAutoRun is `true` must be
+        // inserted with auto-run enabled because the guard is satisfied.
+        let tempDir = FileManager.default.temporaryDirectory
+        let dbPath = tempDir.appendingPathComponent("autorun_guard_some_\(UUID().uuidString).db").path
+
+        let seedQueue = try DatabaseQueue(path: dbPath)
+        try seedQueue.write { db in
+            try db.execute(sql: """
+                CREATE TABLE grdb_migrations (
+                    identifier TEXT NOT NULL PRIMARY KEY
+                )
+            """)
+            for migrationID in prePromptLibraryMigrationIDs + [
+                "v0.7-prompts-and-summaries",
+                "v0.7.1-prompt-default",
+                "v0.7.2-prompt-autorun",
+                "v0.7.3-prompt-autorun-visibility",
+                "v0.7.4-lifetime-dictation-stats",
+                "v0.7.5-meeting-recovery-flag",
+            ] {
+                try db.execute(
+                    sql: "INSERT INTO grdb_migrations (identifier) VALUES (?)",
+                    arguments: [migrationID]
+                )
+            }
+            try db.execute(sql: """
+                CREATE TABLE text_snippets (
+                    id TEXT PRIMARY KEY,
+                    trigger TEXT NOT NULL,
+                    expansion TEXT NOT NULL,
+                    isEnabled INTEGER NOT NULL DEFAULT 1,
+                    useCount INTEGER NOT NULL DEFAULT 0,
+                    createdAt TEXT NOT NULL,
+                    updatedAt TEXT NOT NULL,
+                    action TEXT
+                )
+            """)
+            try db.execute(sql: """
+                CREATE TABLE transcriptions (
+                    id TEXT PRIMARY KEY,
+                    createdAt TEXT NOT NULL,
+                    fileName TEXT NOT NULL,
+                    filePath TEXT,
+                    fileSizeBytes INTEGER,
+                    durationMs INTEGER,
+                    rawTranscript TEXT,
+                    cleanTranscript TEXT,
+                    wordTimestamps TEXT,
+                    language TEXT DEFAULT 'en',
+                    speakerCount INTEGER,
+                    speakers TEXT,
+                    status TEXT NOT NULL DEFAULT 'processing',
+                    errorMessage TEXT,
+                    exportPath TEXT,
+                    updatedAt TEXT NOT NULL,
+                    sourceURL TEXT,
+                    diarizationSegments TEXT,
+                    summary TEXT,
+                    chatMessages TEXT,
+                    thumbnailURL TEXT,
+                    channelName TEXT,
+                    videoDescription TEXT,
+                    isFavorite INTEGER NOT NULL DEFAULT 0,
+                    sourceType TEXT NOT NULL DEFAULT 'file',
+                    recoveredFromCrash INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            try Self.createV05DictationsTable(db: db)
+            try Self.createV05ChatConversationsTable(db: db)
+            try db.execute(sql: """
+                CREATE TABLE prompts (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT 'summary',
+                    isBuiltIn INTEGER NOT NULL DEFAULT 0,
+                    isVisible INTEGER NOT NULL DEFAULT 1,
+                    isAutoRun INTEGER NOT NULL DEFAULT 0,
+                    sortOrder INTEGER NOT NULL DEFAULT 0,
+                    createdAt TEXT NOT NULL,
+                    updatedAt TEXT NOT NULL
+                )
+            """)
+            try db.execute(sql: """
+                CREATE UNIQUE INDEX idx_prompts_name ON prompts(name COLLATE NOCASE)
+            """)
+            try db.execute(sql: """
+                CREATE TABLE summaries (
+                    id TEXT PRIMARY KEY,
+                    transcriptionId TEXT NOT NULL REFERENCES transcriptions(id) ON DELETE CASCADE,
+                    promptName TEXT NOT NULL,
+                    promptContent TEXT NOT NULL,
+                    extraInstructions TEXT,
+                    content TEXT NOT NULL,
+                    createdAt TEXT NOT NULL,
+                    updatedAt TEXT NOT NULL
+                )
+            """)
+            try db.execute(sql: """
+                CREATE INDEX idx_summaries_transcription_id ON summaries(transcriptionId)
+            """)
+            // Insert one auto-run prompt — guard is satisfied.
+            let now = Date()
+            try db.execute(
+                sql: "INSERT INTO prompts (id, name, content, category, isBuiltIn, isVisible, isAutoRun, sortOrder, createdAt, updatedAt) VALUES (?, ?, ?, ?, 0, 1, 1, 0, ?, ?)",
+                arguments: [UUID(), "User's Auto Prompt", "do stuff", "summary", now, now]
+            )
+        }
+
+        let manager = try DatabaseManager(path: dbPath)
+        try manager.dbQueue.read { db in
+            let row = try Row.fetchOne(
+                db,
+                sql: "SELECT isAutoRun FROM prompts WHERE name = 'Summary'"
+            )
+            XCTAssertNotNil(row, "Summary should have been inserted by reconcile")
+            let isAutoRun = (row?["isAutoRun"] as Int?) ?? 0
+            XCTAssertEqual(isAutoRun, 1, "Auto-run guard satisfied; new built-in honors canonical isAutoRun=true (ADR-020 §5)")
+        }
+
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    func testReconcileRemovesRevertedMemoSteeredNotesPrompt() throws {
+        // ADR-020 (2026-05-02 amendment): the "Memo-Steered Notes" built-in
+        // was reverted. Existing DBs that have its row (from a build that
+        // shipped between 2026-04-25 and 2026-05-02) must have it removed by
+        // the reconciler on next launch. The reconciler's generic
+        // "delete built-ins not in the canonical list" path covers this.
+        let tempDir = FileManager.default.temporaryDirectory
+        let dbPath = tempDir.appendingPathComponent("memo_steered_revert_\(UUID().uuidString).db").path
+
+        let memoSteeredID = "1C5A1B4A-7E2C-4D38-B3EF-5C0F8A7E3E1A"
+
+        let seedQueue = try DatabaseQueue(path: dbPath)
+        try seedQueue.write { db in
+            try db.execute(sql: """
+                CREATE TABLE grdb_migrations (
+                    identifier TEXT NOT NULL PRIMARY KEY
+                )
+            """)
+            for migrationID in prePromptLibraryMigrationIDs + [
+                "v0.7-prompts-and-summaries",
+                "v0.7.1-prompt-default",
+                "v0.7.2-prompt-autorun",
+                "v0.7.3-prompt-autorun-visibility",
+                "v0.7.4-lifetime-dictation-stats",
+                "v0.7.5-meeting-recovery-flag",
+            ] {
+                try db.execute(
+                    sql: "INSERT INTO grdb_migrations (identifier) VALUES (?)",
+                    arguments: [migrationID]
+                )
+            }
+            try db.execute(sql: """
+                CREATE TABLE text_snippets (
+                    id TEXT PRIMARY KEY,
+                    trigger TEXT NOT NULL,
+                    expansion TEXT NOT NULL,
+                    isEnabled INTEGER NOT NULL DEFAULT 1,
+                    useCount INTEGER NOT NULL DEFAULT 0,
+                    createdAt TEXT NOT NULL,
+                    updatedAt TEXT NOT NULL,
+                    action TEXT
+                )
+            """)
+            try db.execute(sql: """
+                CREATE TABLE transcriptions (
+                    id TEXT PRIMARY KEY,
+                    createdAt TEXT NOT NULL,
+                    fileName TEXT NOT NULL,
+                    filePath TEXT,
+                    fileSizeBytes INTEGER,
+                    durationMs INTEGER,
+                    rawTranscript TEXT,
+                    cleanTranscript TEXT,
+                    wordTimestamps TEXT,
+                    language TEXT DEFAULT 'en',
+                    speakerCount INTEGER,
+                    speakers TEXT,
+                    status TEXT NOT NULL DEFAULT 'processing',
+                    errorMessage TEXT,
+                    exportPath TEXT,
+                    updatedAt TEXT NOT NULL,
+                    sourceURL TEXT,
+                    diarizationSegments TEXT,
+                    summary TEXT,
+                    chatMessages TEXT,
+                    thumbnailURL TEXT,
+                    channelName TEXT,
+                    videoDescription TEXT,
+                    isFavorite INTEGER NOT NULL DEFAULT 0,
+                    sourceType TEXT NOT NULL DEFAULT 'file',
+                    recoveredFromCrash INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            try Self.createV05DictationsTable(db: db)
+            try Self.createV05ChatConversationsTable(db: db)
+            try db.execute(sql: """
+                CREATE TABLE prompts (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT 'summary',
+                    isBuiltIn INTEGER NOT NULL DEFAULT 0,
+                    isVisible INTEGER NOT NULL DEFAULT 1,
+                    isAutoRun INTEGER NOT NULL DEFAULT 0,
+                    sortOrder INTEGER NOT NULL DEFAULT 0,
+                    createdAt TEXT NOT NULL,
+                    updatedAt TEXT NOT NULL
+                )
+            """)
+            try db.execute(sql: """
+                CREATE UNIQUE INDEX idx_prompts_name ON prompts(name COLLATE NOCASE)
+            """)
+            try db.execute(sql: """
+                CREATE TABLE summaries (
+                    id TEXT PRIMARY KEY,
+                    transcriptionId TEXT NOT NULL REFERENCES transcriptions(id) ON DELETE CASCADE,
+                    promptName TEXT NOT NULL,
+                    promptContent TEXT NOT NULL,
+                    extraInstructions TEXT,
+                    content TEXT NOT NULL,
+                    createdAt TEXT NOT NULL,
+                    updatedAt TEXT NOT NULL
+                )
+            """)
+            try db.execute(sql: """
+                CREATE INDEX idx_summaries_transcription_id ON summaries(transcriptionId)
+            """)
+            // Pre-seed the Memo-Steered Notes row exactly as a 2026-04-25
+            // build would have written it: canonical UUID, isBuiltIn=1,
+            // isAutoRun=1, sortOrder=0.
+            let now = Date()
+            try db.execute(
+                sql: "INSERT INTO prompts (id, name, content, category, isBuiltIn, isVisible, isAutoRun, sortOrder, createdAt, updatedAt) VALUES (?, ?, ?, ?, 1, 1, 1, 0, ?, ?)",
+                arguments: [memoSteeredID, "Memo-Steered Notes", "old prompt body", "summary", now, now]
+            )
+        }
+
+        let manager = try DatabaseManager(path: dbPath)
+        try manager.dbQueue.read { db in
+            let memoSteeredRow = try Row.fetchOne(
+                db,
+                sql: "SELECT id FROM prompts WHERE id = ?",
+                arguments: [memoSteeredID]
+            )
+            XCTAssertNil(memoSteeredRow, "Reverted Memo-Steered Notes row must be deleted by reconcile")
+
+            let nameRow = try Row.fetchOne(
+                db,
+                sql: "SELECT id FROM prompts WHERE name = 'Memo-Steered Notes'"
+            )
+            XCTAssertNil(nameRow, "No prompt with the Memo-Steered Notes name should remain")
+
+            // Reconciler should have inserted Summary as the new sortOrder=0
+            // built-in.
+            let summaryRow = try Row.fetchOne(
+                db,
+                sql: "SELECT sortOrder FROM prompts WHERE name = 'Summary'"
+            )
+            XCTAssertNotNil(summaryRow, "Summary should be present after reconcile")
+            XCTAssertEqual(summaryRow?["sortOrder"] as Int?, 0, "Summary is now sortOrder=0")
+        }
+
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    func testSourceTypeMigrationBackfillsYouTubeRows() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+        let dbPath = tempDir.appendingPathComponent("source_type_migration_\(UUID().uuidString).db").path
+
+        let seedQueue = try DatabaseQueue(path: dbPath)
+        try seedQueue.write { db in
+            try db.execute(sql: """
+                CREATE TABLE grdb_migrations (
+                    identifier TEXT NOT NULL PRIMARY KEY
+                )
+            """)
+            for migrationID in [
+                "v0.1-dictations",
+                "v0.1-transcriptions",
+                "v0.2-custom-words",
+                "v0.2-text-snippets",
+                "v0.3-transcription-source-url",
+                "v0.4-transcription-diarization-segments",
+                "v0.4-transcription-llm-content",
+                "v0.5-private-dictation",
+                "v0.5-chat-conversations",
+                "v0.5-drop-unused-fts",
+                "v0.5-transcription-video-metadata",
+            ] {
+                try db.execute(
+                    sql: "INSERT INTO grdb_migrations (identifier) VALUES (?)",
+                    arguments: [migrationID]
+                )
+            }
+
+            try db.execute(sql: """
+                CREATE TABLE transcriptions (
+                    id TEXT PRIMARY KEY,
+                    createdAt TEXT NOT NULL,
+                    fileName TEXT NOT NULL,
+                    filePath TEXT,
+                    fileSizeBytes INTEGER,
+                    durationMs INTEGER,
+                    rawTranscript TEXT,
+                    cleanTranscript TEXT,
+                    wordTimestamps TEXT,
+                    language TEXT DEFAULT 'en',
+                    speakerCount INTEGER,
+                    speakers TEXT,
+                    status TEXT NOT NULL DEFAULT 'processing',
+                    errorMessage TEXT,
+                    exportPath TEXT,
+                    updatedAt TEXT NOT NULL,
+                    sourceURL TEXT,
+                    diarizationSegments TEXT,
+                    summary TEXT,
+                    chatMessages TEXT,
+                    thumbnailURL TEXT,
+                    channelName TEXT,
+                    videoDescription TEXT,
+                    isFavorite INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+
+            // dictations table is required by the v0.7.4 lifetime stats backfill.
+            try Self.createV05DictationsTable(db: db)
+            try Self.createV05ChatConversationsTable(db: db)
+
+            try db.execute(sql: """
+                CREATE TABLE text_snippets (
+                    id TEXT PRIMARY KEY,
+                    trigger TEXT NOT NULL,
+                    expansion TEXT NOT NULL,
+                    isEnabled INTEGER NOT NULL DEFAULT 1,
+                    useCount INTEGER NOT NULL DEFAULT 0,
+                    createdAt TEXT NOT NULL,
+                    updatedAt TEXT NOT NULL
+                )
+            """)
+
+            let now = Date()
+            try db.execute(
+                sql: """
+                    INSERT INTO transcriptions (id, createdAt, fileName, updatedAt, sourceURL)
+                    VALUES (?, ?, ?, ?, ?)
+                """,
+                arguments: [UUID(), now, "youtube.mp3", now, "https://youtube.com/watch?v=test"]
+            )
+        }
+
+        let manager = try DatabaseManager(path: dbPath)
+        try manager.dbQueue.read { db in
+            let sourceType = try String.fetchOne(db, sql: "SELECT sourceType FROM transcriptions LIMIT 1")
+            XCTAssertEqual(sourceType, Transcription.SourceType.youtube.rawValue)
+        }
+
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    func testSummariesTableIncludesUpdatedAtColumn() throws {
+        let manager = try DatabaseManager()
+        try manager.dbQueue.read { db in
+            let columns = try db.columns(in: "summaries").map(\.name)
+            XCTAssertTrue(columns.contains("updatedAt"), "summaries should have updatedAt column")
+        }
+    }
+
+    func testPromptSummaryMigrationMovesLegacySummaryAndDropsColumn() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+        let dbPath = tempDir.appendingPathComponent("prompt_summary_migration_\(UUID().uuidString).db").path
+        let transcriptionID = UUID()
+        let createdAt = Date(timeIntervalSince1970: 1_712_345_678)
+        let legacySummary = "Existing migrated summary"
+
+        let seedQueue = try DatabaseQueue(path: dbPath)
+        try seedQueue.write { db in
+            try db.execute(sql: """
+                CREATE TABLE grdb_migrations (
+                    identifier TEXT NOT NULL PRIMARY KEY
+                )
+            """)
+            for migrationID in prePromptLibraryMigrationIDs {
+                try db.execute(
+                    sql: "INSERT INTO grdb_migrations (identifier) VALUES (?)",
+                    arguments: [migrationID]
+                )
+            }
+
+            try db.execute(sql: """
+                CREATE TABLE text_snippets (
+                    id TEXT PRIMARY KEY,
+                    trigger TEXT NOT NULL,
+                    expansion TEXT NOT NULL,
+                    isEnabled INTEGER NOT NULL DEFAULT 1,
+                    useCount INTEGER NOT NULL DEFAULT 0,
+                    createdAt TEXT NOT NULL,
+                    updatedAt TEXT NOT NULL,
+                    action TEXT
+                )
+            """)
+
+            try db.execute(sql: """
+                CREATE TABLE transcriptions (
+                    id TEXT PRIMARY KEY,
+                    createdAt TEXT NOT NULL,
+                    fileName TEXT NOT NULL,
+                    filePath TEXT,
+                    fileSizeBytes INTEGER,
+                    durationMs INTEGER,
+                    rawTranscript TEXT,
+                    cleanTranscript TEXT,
+                    wordTimestamps TEXT,
+                    language TEXT DEFAULT 'en',
+                    speakerCount INTEGER,
+                    speakers TEXT,
+                    status TEXT NOT NULL DEFAULT 'processing',
+                    errorMessage TEXT,
+                    exportPath TEXT,
+                    updatedAt TEXT NOT NULL,
+                    sourceURL TEXT,
+                    diarizationSegments TEXT,
+                    summary TEXT,
+                    chatMessages TEXT,
+                    thumbnailURL TEXT,
+                    channelName TEXT,
+                    videoDescription TEXT,
+                    isFavorite INTEGER NOT NULL DEFAULT 0,
+                    sourceType TEXT NOT NULL DEFAULT 'file'
+                )
+            """)
+
+            // dictations table is required by the v0.7.4 lifetime stats backfill.
+            try Self.createV05DictationsTable(db: db)
+            try Self.createV05ChatConversationsTable(db: db)
+
+            try db.execute(
+                sql: """
+                    INSERT INTO transcriptions (
+                        id, createdAt, fileName, updatedAt, summary
+                    ) VALUES (?, ?, ?, ?, ?)
+                """,
+                arguments: [transcriptionID, createdAt, "fixture.wav", createdAt, legacySummary]
+            )
+        }
+
+        let manager = try DatabaseManager(path: dbPath)
+        try manager.dbQueue.read { db in
+            let migratedSummaryCount = try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM summaries WHERE transcriptionId = ?",
+                arguments: [transcriptionID]
+            )
+            let migratedSummaryContent = try String.fetchOne(
+                db,
+                sql: "SELECT content FROM summaries WHERE transcriptionId = ?",
+                arguments: [transcriptionID]
+            )
+            let migratedPromptName = try String.fetchOne(
+                db,
+                sql: "SELECT promptName FROM summaries WHERE transcriptionId = ?",
+                arguments: [transcriptionID]
+            )
+            let migratedPromptContent = try String.fetchOne(
+                db,
+                sql: "SELECT promptContent FROM summaries WHERE transcriptionId = ?",
+                arguments: [transcriptionID]
+            )
+            let transcriptionColumns = try db.columns(in: "transcriptions").map(\.name)
+
+            XCTAssertEqual(migratedSummaryCount, 1)
+            XCTAssertEqual(migratedSummaryContent, legacySummary)
+            XCTAssertEqual(migratedPromptName, "Summary")
+            XCTAssertEqual(migratedPromptContent, Prompt.classicSummaryPrompt().content)
+            XCTAssertFalse(transcriptionColumns.contains("summary"))
+        }
+
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    func testMigrationsAreIdempotent() throws {
+        // Running migrations twice on the SAME database file should not error
+        let tempDir = FileManager.default.temporaryDirectory
+        let dbPath = tempDir.appendingPathComponent("idempotent_test_\(UUID().uuidString).db").path
+
+        // First run — creates tables and indexes
+        let manager1 = try DatabaseManager(path: dbPath)
+        try manager1.dbQueue.read { db in
+            XCTAssertTrue(try db.tableExists("dictations"))
+            XCTAssertTrue(try db.tableExists("transcriptions"))
+        }
+
+        // Second run on the SAME file — migrations should be skipped gracefully
+        let manager2 = try DatabaseManager(path: dbPath)
+        try manager2.dbQueue.read { db in
+            XCTAssertTrue(try db.tableExists("dictations"))
+            XCTAssertTrue(try db.tableExists("transcriptions"))
+        }
+
+        // Clean up
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    func testTransformWorkbenchCleanupMigrationPreservesRestoredHistoryWhenRerun() throws {
+        let dbPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("transform_workbench_cleanup_\(UUID().uuidString).db")
+            .path
+        defer { cleanupDatabaseFiles(atPath: dbPath) }
+
+        do {
+            let manager = try DatabaseManager(path: dbPath)
+            try manager.dbQueue.write { db in
+                try db.execute(sql: """
+                    CREATE TABLE IF NOT EXISTS transform_history (
+                        id TEXT PRIMARY KEY,
+                        inputText TEXT NOT NULL,
+                        outputText TEXT NOT NULL
+                    )
+                """)
+                try db.execute(sql: """
+                    CREATE TABLE IF NOT EXISTS transform_profiles (
+                        promptId TEXT PRIMARY KEY,
+                        customInstructions TEXT
+                    )
+                """)
+                try db.execute(sql: """
+                    CREATE TABLE IF NOT EXISTS writing_samples (
+                        id TEXT PRIMARY KEY,
+                        text TEXT NOT NULL
+                    )
+                """)
+                try db.execute(
+                    sql: "DELETE FROM grdb_migrations WHERE identifier = ?",
+                    arguments: ["v0.16-drop-transform-workbench-tables"]
+                )
+            }
+        }
+
+        let manager = try DatabaseManager(path: dbPath)
+        try manager.dbQueue.read { db in
+            XCTAssertTrue(try db.tableExists("transform_history"))
+            XCTAssertFalse(try db.tableExists("transform_profiles"))
+            XCTAssertFalse(try db.tableExists("writing_samples"))
+
+            let historyColumns = try db.columns(in: "transform_history").map(\.name)
+            XCTAssertTrue(historyColumns.contains("transformName"))
+            XCTAssertTrue(historyColumns.contains("sourceAppBundleID"))
+            XCTAssertTrue(historyColumns.contains("totalElapsedMs"))
+
+            let appliedMigrationIDs = try String.fetchAll(
+                db,
+                sql: """
+                    SELECT identifier FROM grdb_migrations
+                    WHERE identifier IN (?, ?, ?, ?)
+                """,
+                arguments: [
+                    "v0.14-transform-history",
+                    "v0.15-transform-workbench",
+                    "v0.16-drop-transform-workbench-tables",
+                    "v0.17-recreate-transform-history",
+                ]
+            )
+            XCTAssertEqual(
+                Set(appliedMigrationIDs),
+                [
+                    "v0.14-transform-history",
+                    "v0.15-transform-workbench",
+                    "v0.16-drop-transform-workbench-tables",
+                    "v0.17-recreate-transform-history",
+                ]
+            )
+        }
+    }
+
+    func testEngineAttributionMigrationToleratesExistingColumnsWhenMigrationMarkerIsMissing() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+        let dbPath = tempDir.appendingPathComponent("engine_attribution_rerun_\(UUID().uuidString).db").path
+        defer { try? FileManager.default.removeItem(atPath: dbPath) }
+
+        let manager1 = try DatabaseManager(path: dbPath)
+        try manager1.dbQueue.write { db in
+            try db.execute(
+                sql: "DELETE FROM grdb_migrations WHERE identifier = ?",
+                arguments: ["v0.8-engine-attribution"]
+            )
+        }
+
+        let manager2 = try DatabaseManager(path: dbPath)
+        try manager2.dbQueue.read { db in
+            let transcriptionColumns = try db.columns(in: "transcriptions").map(\.name)
+            let dictationColumns = try db.columns(in: "dictations").map(\.name)
+            XCTAssertTrue(transcriptionColumns.contains("engine"))
+            XCTAssertTrue(transcriptionColumns.contains("engineVariant"))
+            XCTAssertTrue(dictationColumns.contains("engine"))
+            XCTAssertTrue(dictationColumns.contains("engineVariant"))
+
+            let migrationRecorded = try Bool.fetchOne(
+                db,
+                sql: "SELECT EXISTS(SELECT 1 FROM grdb_migrations WHERE identifier = ?)",
+                arguments: ["v0.8-engine-attribution"]
+            ) ?? false
+            XCTAssertTrue(migrationRecorded)
+        }
+    }
+
+    func testDictationLanguageMigrationToleratesExistingColumnWhenMigrationMarkerIsMissing() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+        let dbPath = tempDir.appendingPathComponent("dictation_language_rerun_\(UUID().uuidString).db").path
+        defer { try? FileManager.default.removeItem(atPath: dbPath) }
+
+        let manager1 = try DatabaseManager(path: dbPath)
+        try manager1.dbQueue.write { db in
+            try db.execute(
+                sql: "DELETE FROM grdb_migrations WHERE identifier = ?",
+                arguments: ["v0.19-dictation-language"]
+            )
+        }
+
+        let manager2 = try DatabaseManager(path: dbPath)
+        try manager2.dbQueue.read { db in
+            let dictationColumns = try db.columns(in: "dictations").map(\.name)
+            XCTAssertTrue(dictationColumns.contains("language"))
+
+            let migrationRecorded = try Bool.fetchOne(
+                db,
+                sql: "SELECT EXISTS(SELECT 1 FROM grdb_migrations WHERE identifier = ?)",
+                arguments: ["v0.19-dictation-language"]
+            ) ?? false
+            XCTAssertTrue(migrationRecorded)
+        }
+    }
+
+    func testAIFormatterCategoryCheckAcceptsEveryTelemetryAppCategory() throws {
+        // Drift guard: the v0.21 migration freezes the category list inside a
+        // table CHECK, while the Settings picker enumerates
+        // `TelemetryAppCategory.allCases`. If the enum grows without a
+        // follow-up migration, the picker offers a category whose save fails
+        // at the SQLite layer — this test fails first, with a clear message.
+        let manager = try DatabaseManager()
+        let repo = AIFormatterProfileRepository(dbQueue: manager.dbQueue)
+
+        for (index, category) in TelemetryAppCategory.allCases.enumerated() {
+            XCTAssertNoThrow(
+                try repo.save(
+                    AIFormatterProfile.category(
+                        name: "Profile \(category.rawValue)",
+                        appCategory: category,
+                        promptTemplate: "Prompt \(AIFormatter.transcriptPlaceholder)",
+                        sortOrder: index
+                    )
+                ),
+                "Category \(category.rawValue) is not in the frozen v0.21 CHECK list — add a follow-up migration extending it before exposing the new case."
+            )
+        }
+
+        let savedCategories = Set(try repo.fetchAll().compactMap(\.appCategory))
+        XCTAssertEqual(savedCategories, Set(TelemetryAppCategory.allCases))
+    }
+
+    func testAIFormatterProfilesMigrationToleratesExistingSchemaWhenMigrationMarkerIsMissing() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+        let dbPath = tempDir.appendingPathComponent("ai_formatter_rerun_\(UUID().uuidString).db").path
+        defer { cleanupDatabaseFiles(atPath: dbPath) }
+
+        let manager1 = try DatabaseManager(path: dbPath)
+        let repo1 = AIFormatterProfileRepository(dbQueue: manager1.dbQueue)
+        let profile = AIFormatterProfile.category(
+            name: "Email",
+            appCategory: .email,
+            promptTemplate: "Email prompt \(AIFormatter.transcriptPlaceholder)"
+        )
+        try repo1.save(profile)
+        try manager1.dbQueue.write { db in
+            try db.execute(
+                sql: "DELETE FROM grdb_migrations WHERE identifier = ?",
+                arguments: ["v0.21-ai-formatter-profiles"]
+            )
+        }
+
+        let manager2 = try DatabaseManager(path: dbPath)
+        try manager2.dbQueue.read { db in
+            XCTAssertTrue(try db.tableExists("ai_formatter_profiles"))
+            let dictationColumns = try db.columns(in: "dictations").map(\.name)
+            XCTAssertTrue(dictationColumns.contains("aiFormatterProfileID"))
+            XCTAssertTrue(dictationColumns.contains("aiFormatterProfileName"))
+            XCTAssertTrue(dictationColumns.contains("aiFormatterProfileMatchKind"))
+
+            let migrationRecorded = try Bool.fetchOne(
+                db,
+                sql: "SELECT EXISTS(SELECT 1 FROM grdb_migrations WHERE identifier = ?)",
+                arguments: ["v0.21-ai-formatter-profiles"]
+            ) ?? false
+            XCTAssertTrue(migrationRecorded)
+        }
+        let survivingProfiles = try AIFormatterProfileRepository(dbQueue: manager2.dbQueue).fetchAll()
+        XCTAssertEqual(survivingProfiles.map(\.id), [profile.id])
+    }
+
+    func testAIFormatterProfilesMigrationScrubsHiddenDictationRows() throws {
+        // Upgrade-path coverage for the v0.21 privacy backfill: builds before
+        // the profiles PR leaked transcripts and the paste-target bundle ID
+        // into hidden private-mode rows via the post-paste metadata re-save.
+        // The migration must scrub hidden rows on existing DBs and leave
+        // visible rows untouched.
+        let tempDir = FileManager.default.temporaryDirectory
+        let dbPath = tempDir.appendingPathComponent("ai_formatter_scrub_\(UUID().uuidString).db").path
+        defer { cleanupDatabaseFiles(atPath: dbPath) }
+
+        let hiddenID = UUID().uuidString
+        let visibleID = UUID().uuidString
+        let seedQueue = try DatabaseQueue(path: dbPath)
+        try seedQueue.write { db in
+            try db.execute(sql: """
+                CREATE TABLE grdb_migrations (
+                    identifier TEXT NOT NULL PRIMARY KEY
+                )
+            """)
+            for migrationID in prePromptLibraryMigrationIDs.filter({ $0 != "v0.6-transcription-source-type" && $0 != "v0.7-snippet-key-action" }) {
+                try db.execute(
+                    sql: "INSERT INTO grdb_migrations (identifier) VALUES (?)",
+                    arguments: [migrationID]
+                )
+            }
+
+            try Self.createV05DictationsTable(db: db)
+            try Self.createV05ChatConversationsTable(db: db)
+            try db.execute(sql: """
+                CREATE TABLE transcriptions (
+                    id TEXT PRIMARY KEY,
+                    createdAt TEXT NOT NULL,
+                    fileName TEXT NOT NULL,
+                    filePath TEXT,
+                    fileSizeBytes INTEGER,
+                    durationMs INTEGER,
+                    rawTranscript TEXT,
+                    cleanTranscript TEXT,
+                    wordTimestamps TEXT,
+                    language TEXT DEFAULT 'en',
+                    speakerCount INTEGER,
+                    speakers TEXT,
+                    status TEXT NOT NULL DEFAULT 'processing',
+                    errorMessage TEXT,
+                    exportPath TEXT,
+                    updatedAt TEXT NOT NULL,
+                    sourceURL TEXT,
+                    diarizationSegments TEXT,
+                    summary TEXT,
+                    chatMessages TEXT,
+                    thumbnailURL TEXT,
+                    channelName TEXT,
+                    videoDescription TEXT,
+                    isFavorite INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            try db.execute(sql: """
+                CREATE TABLE text_snippets (
+                    id TEXT PRIMARY KEY,
+                    trigger TEXT NOT NULL,
+                    expansion TEXT NOT NULL,
+                    isEnabled INTEGER NOT NULL DEFAULT 1,
+                    useCount INTEGER NOT NULL DEFAULT 0,
+                    createdAt TEXT NOT NULL,
+                    updatedAt TEXT NOT NULL
+                )
+            """)
+
+            let now = Date()
+            try db.execute(
+                sql: """
+                    INSERT INTO dictations
+                        (id, createdAt, durationMs, rawTranscript, cleanTranscript, audioPath, pastedToApp, updatedAt, hidden)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                arguments: [hiddenID, now, 1200, "leaked secret", "leaked clean", "/tmp/leaked.wav", "com.example.private", now, 1]
+            )
+            try db.execute(
+                sql: """
+                    INSERT INTO dictations
+                        (id, createdAt, durationMs, rawTranscript, cleanTranscript, audioPath, pastedToApp, updatedAt, hidden)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                arguments: [visibleID, now, 900, "visible transcript", "visible clean", "/tmp/kept.wav", "com.example.app", now, 0]
+            )
+        }
+
+        let manager = try DatabaseManager(path: dbPath)
+        try manager.dbQueue.read { db in
+            let hidden = try Row.fetchOne(
+                db,
+                sql: "SELECT rawTranscript, cleanTranscript, audioPath, pastedToApp FROM dictations WHERE id = ?",
+                arguments: [hiddenID]
+            )
+            XCTAssertEqual(hidden?["rawTranscript"], "")
+            XCTAssertNil(hidden?["cleanTranscript"] as String?)
+            XCTAssertNil(hidden?["audioPath"] as String?)
+            XCTAssertNil(hidden?["pastedToApp"] as String?)
+
+            let visible = try Row.fetchOne(
+                db,
+                sql: "SELECT rawTranscript, cleanTranscript, audioPath, pastedToApp FROM dictations WHERE id = ?",
+                arguments: [visibleID]
+            )
+            XCTAssertEqual(visible?["rawTranscript"], "visible transcript")
+            XCTAssertEqual(visible?["cleanTranscript"] as String?, "visible clean")
+            XCTAssertEqual(visible?["audioPath"] as String?, "/tmp/kept.wav")
+            XCTAssertEqual(visible?["pastedToApp"] as String?, "com.example.app")
+        }
+    }
+
+    /// Recreates the dictations table at its v0.5 shape (after `v0.5-private-dictation`
+    /// added `hidden` and `wordCount`). Used by partial-migration test fixtures so the
+    /// v0.7.4 lifetime-stats backfill has a real table to read from.
+    static func createV05DictationsTable(db: Database) throws {
+        try db.execute(sql: """
+            CREATE TABLE dictations (
+                id TEXT PRIMARY KEY,
+                createdAt TEXT NOT NULL,
+                durationMs INTEGER NOT NULL,
+                rawTranscript TEXT NOT NULL,
+                cleanTranscript TEXT,
+                audioPath TEXT,
+                pastedToApp TEXT,
+                processingMode TEXT NOT NULL DEFAULT 'raw',
+                status TEXT NOT NULL DEFAULT 'completed',
+                errorMessage TEXT,
+                updatedAt TEXT NOT NULL,
+                hidden INTEGER NOT NULL DEFAULT 0,
+                wordCount INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+    }
+
+    static func createV05ChatConversationsTable(db: Database) throws {
+        try db.execute(sql: """
+            CREATE TABLE chat_conversations (
+                id TEXT PRIMARY KEY,
+                transcriptionId TEXT NOT NULL REFERENCES transcriptions(id) ON DELETE CASCADE,
+                title TEXT NOT NULL DEFAULT '',
+                messages TEXT,
+                createdAt TEXT NOT NULL,
+                updatedAt TEXT NOT NULL
+            )
+        """)
+        try db.execute(sql: """
+            CREATE INDEX idx_chat_conversations_transcription_id
+            ON chat_conversations(transcriptionId)
+        """)
+    }
+
+    private func cleanupDatabaseFiles(atPath path: String) {
+        for suffix in ["", "-shm", "-wal", ".migration.lock"] {
+            try? FileManager.default.removeItem(atPath: path + suffix)
+        }
+    }
+}

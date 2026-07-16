@@ -1,0 +1,145 @@
+name: CI
+
+on:
+  push:
+    paths-ignore:
+      - "docs/**"
+      - "plans/**"
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "plans/**"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  swift-test:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "16.1"
+
+      - name: Toolchain Versions
+        timeout-minutes: 2
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Check Subsystem README References
+        timeout-minutes: 1
+        run: |
+          mkdir -p .ci-logs
+          set -o pipefail
+          ./scripts/check-readme-references.sh 2>&1 | tee .ci-logs/check-readme-references.log
+
+      - name: Swift Format Lint (informational)
+        continue-on-error: true
+        timeout-minutes: 3
+        run: |
+          mkdir -p .ci-logs
+          set -o pipefail
+          xcrun swift-format lint --recursive --configuration .swift-format Sources Tests 2>&1 | tee .ci-logs/swift-format-lint.log
+
+      - name: Cache SwiftPM Dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-spm-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      - name: Swift Build (Release)
+        timeout-minutes: 15
+        run: |
+          mkdir -p .ci-logs
+          set -o pipefail
+          swift build -c release 2>&1 | tee .ci-logs/swift-build-release.log
+
+      - name: CLI Contract Smoke
+        timeout-minutes: 2
+        env:
+          MACPARAKEET_TELEMETRY: "0"
+        run: |
+          mkdir -p .ci-logs
+          set -o pipefail
+          .build/release/macparakeet-cli --help > .ci-logs/cli-help.txt
+          .build/release/macparakeet-cli spec --json > .ci-logs/cli-spec.json
+          python3 -m json.tool .ci-logs/cli-spec.json > /dev/null
+          python3 - <<'PY'
+          import json
+
+          with open(".ci-logs/cli-spec.json", encoding="utf-8") as f:
+              spec = json.load(f)
+
+          commands = {
+              tuple(command["path"]): command
+              for command in spec["commands"]
+          }
+          export = commands[("meetings", "export")]
+          if export["jsonMode"] != "--stdout --format json":
+              raise SystemExit(
+                  f"Unexpected meetings export jsonMode: {export['jsonMode']!r}"
+              )
+          PY
+
+      - name: Release Bundle Smoke
+        timeout-minutes: 15
+        env:
+          BUILD_SYSTEM: swiftpm
+          BUNDLE_YTDLP: "0"
+          BUNDLE_NODE: "0"
+          FFMPEG_PATH: /usr/bin/true
+          VERSION: 0.0.0
+          BUILD_NUMBER: ci
+        run: |
+          mkdir -p .ci-logs
+          set -o pipefail
+          ./scripts/dist/build_app_bundle.sh 2>&1 | tee .ci-logs/release-bundle-smoke.log
+
+      - name: Swift Concurrency Safety
+        timeout-minutes: 15
+        run: |
+          mkdir -p .ci-logs
+          set -o pipefail
+          swift build -Xswiftc -warn-concurrency 2>&1 | tee .ci-logs/swift-concurrency-safety.log
+
+      - name: Swift 6 Language Mode
+        timeout-minutes: 15
+        env:
+          # Argmax/WhisperKit v0.18.0 is required for real builds but is not
+          # Swift 6 language-mode clean yet. Keep this step focused on
+          # first-party MacParakeet sources while release/test builds compile
+          # the full WhisperKit dependency graph.
+          MACPARAKEET_SKIP_WHISPERKIT: "1"
+        run: |
+          mkdir -p .ci-logs
+          set -o pipefail
+          swift build --build-path .build-swift6-no-whisper -Xswiftc -swift-version -Xswiftc 6 2>&1 | tee .ci-logs/swift-6-language-mode.log
+
+      - name: Swift Test
+        timeout-minutes: 20
+        run: |
+          mkdir -p .ci-logs
+          set -o pipefail
+          swift test --parallel 2>&1 | tee .ci-logs/swift-test.log
+
+      - name: Upload CI Logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: swift-ci-logs
+          path: .ci-logs/
+          if-no-files-found: ignore
+          retention-days: 7

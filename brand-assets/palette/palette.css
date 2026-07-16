@@ -1,0 +1,20 @@
+/* MacParakeet Pop Palette — see palette.json for philosophy + guidance. */
+:root {
+  /* Anchors */
+  --mp-ink:      #0E0F12;
+  --mp-paper:    #F8F4EC;
+
+  /* Brand accent (mirrors DesignSystem.Colors.accent in-app) */
+  --mp-coral:    #E86B3B;
+
+  /* Pop family */
+  --mp-marigold: #F4B83A;
+  --mp-lemon:    #F1E04E;
+  --mp-lime:     #A6D74E;
+  --mp-forest:   #2F7A4F;
+  --mp-aqua:     #3FC5C2;
+  --mp-cobalt:   #2A52BE;
+  --mp-lavender: #A684E8;
+  --mp-magenta:  #E03B92;
+  --mp-brick:    #B53D2C;
+}

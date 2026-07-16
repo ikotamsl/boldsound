@@ -1,0 +1,574 @@
+# 11 - LLM Integration
+
+> Status: **IMPLEMENTED** - Done, still accurate (CLI command signatures updated 2026-04-26)
+> Supersedes: Previous HISTORICAL version (local Qwen3-8B via mlx-swift-lm, removed 2026-02-23)
+> ADR: ADR-011 (Cloud API keys + optional local providers)
+> Note: §1 (Transcript Summary) is superseded by [spec/12-processing-layer.md](12-processing-layer.md) — Prompt Library + multi-summary architecture. §3's old UserDefaults custom-transform design is superseded by ADR-022's productized `Prompt.Category.transform` Transforms. Provider protocol, formatter, chat, and CLI sections remain current.
+
+This spec defines how MacParakeet integrates LLM-powered features via user-selected providers,
+including external providers, local servers/CLI tools, and a developer-gated in-process local
+model option.
+
+---
+
+## Goals
+
+1. Deliver transcript summarization, chat, AI formatting, and Transforms via user-configured LLM providers.
+2. Support cloud APIs (Anthropic, OpenAI, Gemini, OpenRouter), local runtimes (Ollama), and CLI tools (Claude Code, Codex) through one shared service layer.
+3. Keep core speech processing local and preserve a fully local setup when users stick to local providers/features — only transcript text is sent to LLM providers, never audio.
+4. LLM features are optional — the app is fully functional without any provider configured.
+
+## Non-Goals
+
+1. Bundling any LLM runtime/model or making local LLMs the public default. The in-process MLX runtime remains a gated app-build target, and the verified model downloader/setup UI stays hidden behind a developer enable path while `AppFeatures.inProcessLocalLLMEnabled == false`.
+2. Bundled/default LLM processing in the dictation hot path. The AI formatter is opt-in, runs after deterministic cleanup, and falls back to the deterministic result if the provider fails.
+3. Building a hosted backend or proxy service.
+4. Automatic fallback between providers.
+
+**Local MLX status (updated 2026-07-05):** The in-process provider, MLX runtime seam, verified model downloader, and one-click Settings card now exist as a developer-gated foundation. The public feature flag remains off, downloads are never automatic, and public one-click setup remains blocked by runtime capability gating, setup UX, release readiness, and Phase 0 quality evidence. The first plausible public scope is single-transcript cleanup/summarization/Q&A; cross-meeting or whole-library analysis remains future-gated. Cloud/frontier providers remain the recommended quality path per surface until local capability reaches parity there. See `plans/active/2026-06-27-on-device-local-llm.md`.
+
+---
+
+## Architecture
+
+```text
+User triggers LLM action (Summary / Chat / Formatter / Transform)
+    → LLMService (builds prompt with transcript context)
+    → LLMExecutionContextResolver (resolves provider config + CLI config)
+    → RoutingLLMClient
+        → .inProcessLocal: InProcessLLMClient → LocalLLMRuntime (MLX only in gated app builds)
+        → .localCLI: LocalCLILLMClient → LocalCLIExecutor (posix_spawn)
+        → .other:    LLMClient (URLSession)
+            → .anthropic: POST /v1/messages
+            → .ollama:    POST /api/chat
+            → .openai/.gemini/.openrouter: POST /chat/completions
+    → Response streamed back to UI
+```
+
+### Provider Protocol
+
+The current branch does not flatten every provider into one wire protocol. `RoutingLLMClient` shares one high-level interface, but transport branches by provider:
+
+- **Anthropic** uses the native Messages API (`POST /v1/messages`).
+- **Ollama** uses the native chat API (`POST /api/chat`) so thinking can be disabled.
+- **OpenAI, Gemini, OpenRouter, and LM Studio** use the OpenAI-compatible chat completions API (`POST /chat/completions` off each provider's configured base URL).
+- **Local CLI** is not HTTP at all; prompts are passed to a subprocess via stdin/environment.
+- **Local MLX** is in-process through `InProcessLLMClient` and `LocalLLMRuntime`; the concrete MLX target is compiled only for gated app builds.
+
+Streaming is provider-specific under the hood:
+
+- Anthropic streams event frames from the Messages API.
+- OpenAI-compatible providers stream SSE `data:` lines.
+- Ollama streams NDJSON chat chunks.
+- Local CLI yields stdout incrementally.
+
+The service boundary stays stable even though the transport is mixed.
+
+### Supported Providers
+
+| Provider | Type | Default Base URL | Auth |
+|----------|------|-----------------|------|
+| Anthropic | Cloud | `https://api.anthropic.com/v1/` | `Authorization: Bearer` |
+| OpenAI | Cloud | `https://api.openai.com/v1` | `Authorization: Bearer` |
+| OpenAI-Compatible | Custom | User-supplied | Optional API key; local loopback endpoints are treated as local |
+| Google Gemini | Cloud | `https://generativelanguage.googleapis.com/v1beta/openai` | `Authorization: Bearer` |
+| Ollama | Local | `http://localhost:11434/v1` | `apiKey: nil` in config; client injects `Bearer ollama` |
+| LM Studio | Local | `http://localhost:1234/v1` | Optional API token (`Authorization: Bearer`) |
+| OpenRouter | Cloud | `https://openrouter.ai/api/v1` | `Authorization: Bearer` |
+| Local CLI | CLI | N/A (subprocess) | N/A (tool manages its own auth) |
+| Local MLX | In-process local, developer-gated | `inprocess://local` | N/A |
+
+**Local CLI:** Users with Claude Code or Codex subscriptions can use their CLI tools directly. The app runs the configured command as a subprocess via `posix_spawn`, delivering prompts via stdin and `MACPARAKEET_*` environment variables. No API key needed — the CLI tool manages its own authentication. Built-in presets for Claude Code (`claude -p --model haiku`) and Codex (`codex exec --model gpt-5.4-mini`), or any custom command. See PR #47.
+
+---
+
+## Core Types
+
+### Provider Configuration
+
+```swift
+public struct LLMProviderConfig: Codable, Sendable, Equatable {
+    public let id: LLMProviderID
+    public let baseURL: URL
+    public let apiKey: String?         // nil for providers without auth; optional for LM Studio/OpenAI-compatible
+    public let modelName: String       // e.g. "claude-sonnet-4-6", "gpt-4.1", "qwen3.5:4b"
+    public let isLocal: Bool           // true for Ollama, LM Studio, and loopback OpenAI-compatible endpoints
+}
+
+public enum LLMProviderID: String, Codable, Sendable, CaseIterable {
+    case anthropic
+    case openai
+    case openaiCompatible
+    case gemini
+    case openrouter
+    case ollama
+    case lmstudio
+    case localCLI    // CLI tools (claude -p, codex exec) — no HTTP, no API key
+    case inProcessLocal // Developer-gated Local MLX option; no HTTP, no API key
+}
+```
+
+API keys are stored in Keychain (via existing `KeychainKeyValueStore`), not UserDefaults. Provider config (ID, base URL, model name) is stored in UserDefaults. **Important:** `apiKey` must be excluded from `Codable` encoding via custom `CodingKeys` to prevent leaking secrets to UserDefaults. The key is always read/written separately through Keychain.
+
+### Client Protocol
+
+```swift
+public protocol LLMClientProtocol: Sendable {
+    /// Single response
+    func chatCompletion(
+        messages: [ChatMessage],
+        context: LLMExecutionContext,
+        options: ChatCompletionOptions
+    ) async throws -> ChatCompletionResponse
+
+    /// Streaming response
+    func chatCompletionStream(
+        messages: [ChatMessage],
+        context: LLMExecutionContext,
+        options: ChatCompletionOptions
+    ) -> AsyncThrowingStream<String, Error>
+
+    /// Verify provider is reachable and auth is valid
+    func testConnection(context: LLMExecutionContext) async throws
+
+    /// Fetch available models when supported by the provider
+    func listModels(context: LLMExecutionContext) async throws -> [String]
+}
+
+public struct ChatMessage: Codable, Sendable {
+    public let role: Role
+    public let content: String
+    public let modelPromptOverride: String?
+
+    public enum Role: String, Codable, Sendable {
+        case system, user, assistant
+    }
+
+    public var modelContent: String {
+        role == .user ? (modelPromptOverride ?? content) : content
+    }
+}
+
+public struct ChatCompletionOptions: Sendable {
+    public let temperature: Double?
+    public let maxTokens: Int?
+}
+
+public struct ChatCompletionResponse: Sendable {
+    public let content: String
+    public let reasoningContent: String?
+    public let finishReason: String?
+    public let model: String
+    public let usage: TokenUsage?
+}
+
+public struct TokenUsage: Sendable {
+    public let promptTokens: Int
+    public let completionTokens: Int
+}
+
+public struct LLMResult: Sendable, Codable {
+    public let output: String
+    public let provider: String
+    public let model: String
+    public let usage: LLMUsage?
+    public let stopReason: String?
+    public let latencyMs: Int
+}
+
+public struct LLMUsage: Sendable, Codable {
+    public let promptTokens: Int?
+    public let completionTokens: Int?
+    public let totalTokens: Int?
+}
+
+public struct LLMFormatterResult: Sendable {
+    public let result: LLMResult
+    public let operationID: String
+    public let inputChars: Int
+    public let outputChars: Int
+    public let inputTruncated: Bool
+    public let defaultPromptUsed: Bool
+    public let messageCount: Int
+
+    public var output: String { result.output }
+}
+```
+
+### Service Protocol
+
+```swift
+public protocol LLMServiceProtocol: Sendable {
+    func generatePromptResult(transcript: String, systemPrompt: String?) async throws -> String
+
+    /// Chat about a transcript (maintains conversation context)
+    func chat(
+        question: String,
+        transcript: String,
+        userNotes: String?,
+        history: [ChatMessage]
+    ) async throws -> String
+
+    /// Apply a custom transform to text
+    func transform(text: String, prompt: String) async throws -> String
+    func formatTranscript(
+        transcript: String,
+        promptTemplate: String,
+        source: TelemetryFormatterSource,
+        defaultPromptUsed: Bool
+    ) async throws -> String
+    func formatTranscriptDetailed(
+        transcript: String,
+        promptTemplate: String,
+        source: TelemetryFormatterSource,
+        defaultPromptUsed: Bool
+    ) async throws -> LLMFormatterResult
+
+    /// Envelope variants used by CLI JSON output
+    func generatePromptResultDetailed(
+        transcript: String,
+        systemPrompt: String?
+    ) async throws -> LLMResult
+    func chatDetailed(
+        question: String,
+        transcript: String,
+        userNotes: String?,
+        history: [ChatMessage]
+    ) async throws -> LLMResult
+    func transformDetailed(text: String, prompt: String) async throws -> LLMResult
+
+    /// Streaming variants
+    func generatePromptResultStream(
+        transcript: String,
+        systemPrompt: String?
+    ) -> AsyncThrowingStream<String, Error>
+    func chatStream(
+        question: String,
+        transcript: String,
+        userNotes: String?,
+        history: [ChatMessage]
+    ) -> AsyncThrowingStream<String, Error>
+    func transformStream(text: String, prompt: String) -> AsyncThrowingStream<String, Error>
+}
+```
+
+### Error Types
+
+```swift
+public enum LLMError: Error, LocalizedError, Sendable {
+    case notConfigured             // No provider set up
+    case connectionFailed(String)  // Network/localhost unreachable
+    case authenticationFailed      // Invalid API key
+    case cliError(String)          // Local CLI subprocess failure
+    case rateLimited               // Provider rate limit
+    case modelNotFound(String)     // Model name invalid
+    case contextTooLong            // Transcript exceeds model context
+    case providerError(String)     // Provider-specific error message
+    case streamingError(String)    // SSE parse failure or stream interruption
+}
+```
+
+---
+
+## Features
+
+### 1. Transcript Summary
+
+**Trigger:** "Summarize" button on transcript result view (file + YouTube transcriptions).
+
+**Behavior:**
+- Sends transcript text to LLM with a summary prompt
+- Streams response into a summary section below the transcript
+- Summary is persisted with the transcription record (new `summary` column)
+- Re-summarize overwrites previous summary
+
+**System prompt:**
+```
+You are a helpful assistant that summarizes transcripts. Provide a clear,
+concise summary that captures the key points, decisions, and action items.
+Use bullet points for clarity. Keep the summary under 500 words.
+```
+
+**Context assembly:** Full transcript text. If transcript exceeds the context budget, truncate from the middle with an ellipsis marker, preserving the head and tail within the limit. Truncation snaps to word boundaries to avoid slicing multi-byte Unicode. The transcript budget accounts for the rendered summary system prompt so the combined request stays inside the provider budget; if a custom prompt has already rendered transcript text into the system prompt, that rendered prompt is bounded too. **Budget:** 500,000 characters for cloud providers, 80,000 characters for most local providers (`isLocal == true`), and 8,000 characters for LM Studio because its effective context depends on the model loaded in the desktop server.
+
+### 2. Chat with Transcript
+
+**Trigger:** "Chat" button/tab on transcript result view.
+
+**Behavior:**
+- Opens a chat panel alongside the transcript
+- User asks questions, LLM responds with transcript as context
+- Conversation history is persisted per transcription where a `ChatConversationRepository` is available; live in-meeting Ask uses in-memory history until it can be promoted after finalization
+- Quick-prompt turns store the visible label in `content` and the actual model prompt in `modelPromptOverride`; regenerate and later model-history assembly use `modelPromptOverride` while the UI continues to show the label
+- Streaming responses displayed incrementally
+
+**System prompt:**
+```
+You are a helpful assistant. The user will ask questions about the following
+transcript. Answer based on the transcript content. If the answer isn't in
+the transcript, say so. Be concise and specific, citing relevant parts when helpful.
+
+<transcript>
+{transcript_text}
+</transcript>
+```
+
+**Context assembly:** System prompt with full transcript + conversation history. Same context budget as summary (500K cloud / 80K local, 8K LM Studio). Notes and transcript are budgeted together inside the system prompt with a small recent-history reserve; if the remaining context exceeds the budget, drop oldest conversation turns first (keep system prompt + recent turns).
+
+**User notes (meeting recordings, optional):** When the transcription has non-empty `userNotes`, the chat system prompt gains a `User's notes from the meeting:\n…` block before the transcript block. Empty / nil / whitespace-only notes are omitted entirely — chat behavior is byte-identical to a chat without notes. Threaded via `LLMService.chat / chatStream / chatDetailed`'s `userNotes: String?` parameter; the GUI calls `TranscriptChatViewModel.bindUserNotesProvider(_:)` with a closure that returns the latest notes at chat-send time (static for saved transcriptions, live for in-meeting Ask). See ADR-020's 2026-05-02 amendment for context on why this is safe even though the auto-run "Memo-Steered Notes" prompt was reverted.
+
+### 3. Transforms
+
+> Superseded design note: the original dedicated custom-transform concept used UserDefaults and transcript-view actions. The current implementation is ADR-022: system-wide selected-text rewrites stored as `Prompt` rows with `category == .transform`.
+
+**Trigger:** User selects text in any app and presses a bound Transform hotkey, such as `Control-Option-1` for `Polish`.
+
+**Built-ins:** `Polish`, `Distill`, and `Decide`, seeded from `Prompt.builtInPrompts()`.
+
+**Custom Transforms:**
+- User provides a name, prompt body, optional shortcut, and optional running label
+- Stored in SQLite through `PromptRepository`
+- Managed by the GUI Transforms tab or `macparakeet-cli transforms`
+- Run output can be recorded locally in `transform_history`; `llm_runs` stores only metadata when a durable source row exists
+
+**System prompt for transforms:**
+```
+{user_prompt_or_builtin_prompt}
+
+Respond with only the transformed text. Do not add explanations or preamble.
+```
+
+**Context assembly:** Selected text is truncated after accounting for the transform system prompt, instruction wrapper, and custom prompt. Same provider budgets as summary/chat (500K cloud / 80K local, 8K LM Studio).
+
+---
+
+## UI
+
+### Settings > AI
+
+The public Settings flow defaults to no AI provider and recommends cloud/frontier
+providers for best answer quality. The Local MLX one-click card is visible only
+when the developer override is active (`MacParakeetEnableInProcessLocalLLM` or
+`--enable-local-ai`); the public feature flag remains off. That card RAM-gates
+machines below 16 GB, downloads the verified Qwen3 model to
+`Application Support/MacParakeet/LLMModels/`, verifies size + SHA-256 hashes,
+tests the in-process runtime, and only then saves `.inProcessLocal`.
+
+```
+┌─────────────────────────────────────────────┐
+│  AI                                          │
+│                                              │
+│  Provider: [Anthropic ▾]                     │
+│                                              │
+│  API Key:  [••••••••••••••••]  [Test ✓]     │
+│                                              │
+│  Model:    [claude-sonnet-4-20250514    ]      │
+│                                              │
+│  ┌─────────────────────────────────────────┐ │
+│  │ ℹ Transcription is always local.        │ │
+│  │   AI features send transcript text to   │ │
+│  │   your chosen provider.                 │ │
+│  │                                         │ │
+│  │   For fully local AI, use Ollama.       │ │
+│  └─────────────────────────────────────────┘ │
+│                                              │
+│  AI Formatter                                │
+│  [Enable] [Prompt editor] [Reset]            │
+└─────────────────────────────────────────────┘
+```
+
+Transforms are managed in the dedicated Transforms sidebar tab, not in Settings.
+
+### Dictation AI Formatter Profiles
+
+Dictation routes through local formatter profiles and built-in category smart
+defaults before calling `LLMService`:
+
+1. Capture a best-effort local app context at dictation start.
+2. Capture the focused target app again at stop/undo time.
+3. Resolve an enabled exact-bundle profile first.
+4. Resolve an enabled coarse-category profile second.
+5. Resolve a built-in coarse-category smart default third, subject to the
+   user's smart-defaults policy.
+6. Fall back to the user-editable AI Formatter fallback prompt.
+
+The smart-default tier is user-controllable through
+`AIFormatterSmartDefaultsPolicy` (UserDefaults-backed, no schema change): a
+master "Smart defaults" switch plus per-category switches in Settings, where
+each built-in prompt is also readable before it ever runs. The prompt preview
+remains readable when the master switch is off; the grid dims and per-category
+switches are disabled until the master switch is turned back on. With the
+master switch off (or a category switched off), resolution skips that tier
+entirely, so a user who tuned the fallback prompt gets byte-for-byte
+pre-profiles behavior wherever no custom profile matches. Profile-fetch
+failures degrade to the fallback prompt and are logged via OSLog
+(`AIFormatter` category).
+
+Saved dictation rows surface their routing provenance in History: rows
+formatted by an app or category profile (custom or smart default) show a small
+labeled chip, answering "why did this dictation come out formatted that way?"
+locally without telemetry.
+
+`AppPromptContext` contains the local bundle identifier, display name, and
+`TelemetryAppCategory`. The exact app fields are used only for local profile
+matching and local dictation history/debug provenance. Telemetry continues to
+emit only the existing coarse `app_category`; it does not include formatter
+profile ids, profile names, exact bundle identifiers, app display names, prompt
+bodies, transcripts, browser hostnames, clipboard text, selected text, or screen
+text.
+
+The production context adapter is `FocusedAppContextService`, an AppKit-shaped
+service that reads `NSWorkspace.shared.frontmostApplication` without giving Core
+UI ownership. Focus drift is handled by preferring a valid stop/undo-time
+context and falling back to the start-time context when the finish context is
+missing or points at MacParakeet itself.
+
+Profiles apply only to Dictation AI Formatter in V1. File/URL and meeting
+transcription formatting continues to use the fallback formatter prompt
+(all transcription finalization paths share `completeTranscription`, which
+invokes the formatter). The transcripts-side formatter has its own
+"Use for transcripts" toggle (default on) and an input-length cap that
+skips formatting for transcripts too long to rewrite inside realistic
+provider timeouts (#493).
+
+Browser hostname/domain matching is intentionally deferred. In V1, Gmail in
+Chrome can match an exact Chrome profile or the coarse `browser` category, but
+MacParakeet does not inspect the active tab URL or window title.
+
+### Transcript View (with LLM features)
+
+```
+┌──────────────────────────────────────────────────────┐
+│  my-recording.mp3                    [Summary] [Chat]│
+│                                                      │
+│  ┌─── Transcript ──────────────────────────────────┐ │
+│  │ Speaker 1: Welcome everyone to the meeting...   │ │
+│  │ Speaker 2: Thanks. Let's start with the update  │ │
+│  │ on the Q1 results...                            │ │
+│  │ ...                                             │ │
+│  └─────────────────────────────────────────────────┘ │
+│                                                      │
+│  ┌─── Summary ─────────────────────────────────────┐ │
+│  │ • Q1 results exceeded targets by 12%            │ │
+│  │ • Decision to expand team by 3 headcount        │ │
+│  │ • Action: Sarah to prepare hiring plan by Fri   │ │
+│  └─────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────┘
+```
+
+### Chat Panel
+
+```
+┌──────────────────────────────────────────────────────┐
+│  Chat about this transcript                          │
+│                                                      │
+│  ┌─────────────────────────────────────────────────┐ │
+│  │ You: What were the main action items?           │ │
+│  │                                                 │ │
+│  │ AI: Based on the transcript, there were three   │ │
+│  │ action items:                                   │ │
+│  │ 1. Sarah to prepare hiring plan by Friday       │ │
+│  │ 2. Mike to update the Q2 forecast...            │ │
+│  │ ...                                             │ │
+│  └─────────────────────────────────────────────────┘ │
+│                                                      │
+│  ┌─────────────────────────────────────────────────┐ │
+│  │ Ask a question about this transcript...    [↑]  │ │
+│  └─────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────┘
+```
+
+---
+
+## Data Model Changes
+
+> Historical note: this section predates the Prompt Library in [spec/12-processing-layer.md](12-processing-layer.md). The `summary` column shipped, but prompt persistence now lives in the prompt/summary model described in spec/12 rather than a standalone custom-transform store.
+
+The original implementation added `transcriptions.summary`. The current branch
+migrated that legacy column into the `summaries` table, whose Swift model is
+`PromptResult`. Prompt templates live in `prompts`, generated outputs live in
+`summaries`, and transcript chat lives in `chat_conversations`. See
+[spec/01-data-model.md](01-data-model.md) and
+[spec/12-processing-layer.md](12-processing-layer.md) for the authoritative
+schema.
+
+Custom transforms were the original plan for this spec. The current branch
+routes summary/transform prompting through the Prompt Library architecture in
+[spec/12-processing-layer.md](12-processing-layer.md).
+
+---
+
+## CLI Support
+
+All CLI LLM commands require `--provider`; `--api-key` is required only for
+cloud providers that need one. Supported providers: `anthropic`, `openai`,
+`openaiCompatible`/`openai-compatible`, `gemini`, `openrouter`, `ollama`,
+`lmstudio`, and `cli`.
+
+```bash
+# Test provider connectivity
+macparakeet-cli llm test-connection --provider openai --api-key sk-...
+
+# Summarize a transcript file
+macparakeet-cli llm summarize transcript.txt --provider anthropic --api-key sk-ant-...
+
+# Chat with a transcript (--question flag required)
+macparakeet-cli llm chat transcript.txt --provider openai --api-key sk-... --question "What were the action items?"
+
+# Transform text with custom instruction
+macparakeet-cli llm transform input.txt --provider anthropic --api-key sk-ant-... --prompt "Make formal"
+
+# LM Studio provider (API key optional)
+macparakeet-cli llm test-connection --provider lmstudio --model qwen3.5-27b
+macparakeet-cli llm summarize transcript.txt --provider lmstudio --model qwen3.5-27b
+macparakeet-cli llm summarize transcript.txt --provider lmstudio --model qwen3.5-27b --api-key-env LM_API_TOKEN
+```
+
+```bash
+# Local CLI provider (no API key needed)
+macparakeet-cli llm test-connection --provider cli --command "claude -p --model haiku"
+macparakeet-cli llm summarize transcript.txt --provider cli --command "claude -p --model haiku"
+```
+
+Additional options: `--model`, `--base-url`, `--stream`, `--json`, `--command` (Local CLI only). Use `-` as input to read from stdin. `--json` emits a structured envelope with `output`, `provider`, `model`, optional `usage`, optional `stopReason`, and `latencyMs`. `llm test-connection --json` emits `{ok, provider, model, latencyMs}` on success. `--json --stream` is rejected until NDJSON streaming lands.
+
+CLI LLM commands use ephemeral inline config (not shared with GUI UserDefaults/Keychain).
+
+---
+
+## Testing
+
+### Unit Tests
+
+1. **LLMClient**: Mock URLSession, verify request format (headers, body, auth) for each provider type.
+2. **LLMService**: Mock LLMClient, verify prompt assembly for summarize/chat/transform.
+3. **Context assembly**: Verify truncation behavior when transcript exceeds limits.
+4. **Provider config**: Verify Keychain storage/retrieval of API keys. Verify UserDefaults storage of provider config.
+5. **Error mapping**: Verify error mapping inspects response body JSON first (providers return `{"error": {"message": "...", "type": "..."}}`), then falls back to HTTP status codes.
+6. **Streaming**: Verify SSE parsing for streamed responses.
+
+### Integration Tests
+
+1. **Provider connectivity**: Test connection to each provider type (mocked HTTP server).
+2. **End-to-end flow**: Transcript → summarize → persist summary → display.
+
+### What We Skip
+
+- Actual LLM output quality (depends on external model, not our code).
+- Ollama installation or model management.
+- Cloud provider uptime or rate limits.
+
+---
+
+## Acceptance Criteria
+
+1. User can configure any supported provider in Settings.
+2. API keys are stored in Keychain, never in plain text.
+3. "Test Connection" button verifies provider reachability and auth.
+4. Summary, chat, and transform actions route through `LLMService` and stream results in the current UI/CLI surfaces.
+5. Chat panel supports multi-turn conversation with transcript context.
+6. Prompt-driven transforms remain supported through `LLMService`, with Prompt Library details defined in [spec/12-processing-layer.md](12-processing-layer.md).
+7. All LLM features are unavailable (greyed out with explanation) when no provider is configured.
+8. Transcription continues to work fully offline regardless of LLM configuration.
+9. Privacy notice in Settings clearly explains what data is sent where.
+10. `swift test` passes with new LLM seam tests.

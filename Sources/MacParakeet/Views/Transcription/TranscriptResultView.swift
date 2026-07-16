@@ -1,0 +1,3882 @@
+import AVKit
+import SwiftUI
+import MacParakeetCore
+import MacParakeetViewModels
+
+/// One searchable unit of the transcript reading surface (U2): a renderable
+/// text block plus its rendering context. In Timed mode `id` is the segment
+/// `startMs`. In Text mode the matcher searches the full transcript as a
+/// single block so cross-paragraph text selection stays intact.
+private struct TranscriptFindBlock: Equatable, Identifiable {
+    let id: Int
+    let text: String
+}
+
+/// Invisible scroll target inside the full-text transcript. Text mode keeps one
+/// selectable `Text` for the transcript body, then overlays a single prefix
+/// target for the active match so find navigation can still land near it.
+private struct TranscriptTextFindAnchor: Equatable, Identifiable {
+    let id: Int
+    let prefixText: String
+}
+
+/// Data-driven model for the export confirmation popover.
+/// Using a single `Identifiable` value with `.popover(item:)` ensures
+/// the popover content always has the correct URL and format — no race
+/// between separate presentation and data states.
+private struct ExportConfirmation: Identifiable {
+    let id = UUID()
+    let url: URL
+    /// Full heading shown in the confirmation popover, e.g.
+    /// "Exported Markdown" or "Saved Audio". The popover renders this
+    /// verbatim so callers control the verb-noun phrasing.
+    let title: String
+}
+
+private struct RetranscriptionConfirmation: Identifiable {
+    let id = UUID()
+    let transcriptionID: UUID
+    let speechEngineOverride: SpeechEngineSelection?
+
+    var title: String {
+        if let speechEngineOverride {
+            "Try with \(speechEngineOverride.engine.displayName)?"
+        } else {
+            "Retranscribe this file?"
+        }
+    }
+
+    var confirmLabel: String {
+        if let speechEngineOverride {
+            "Try with \(speechEngineOverride.engine.displayName)"
+        } else {
+            "Retranscribe"
+        }
+    }
+
+    var message: String {
+        "Replaces this transcript. Prompts and chats are preserved."
+    }
+}
+
+private enum TranscriptDisplayMode: String, CaseIterable, Hashable {
+    case text = "Text"
+    case timed = "Timed"
+}
+
+/// Records the user's engine choice from the retranscribe popover so the
+/// confirmation alert can be presented in a *separate* render cycle from
+/// the popover dismissal — chaining popover → alert in the same cycle on
+/// macOS reliably drops the alert. The single `override` field carries
+/// nil when the user picked the primary engine (no override needed) and
+/// `.some` when they picked the alternative.
+private struct RetranscribePick: Sendable {
+    let transcriptionID: UUID
+    let override: SpeechEngineSelection?
+}
+
+struct MeetingTimedTranscriptRecoveryBannerPresentation: Equatable {
+    struct Action: Equatable {
+        let title: String
+        let selection: SpeechEngineSelection
+    }
+
+    let title: String
+    let message: String
+    let action: Action?
+
+    static func make(
+        transcriptText: String,
+        hasRetainedAudio: Bool,
+        timestampCapableRerun: SpeechEngineSelection?
+    ) -> MeetingTimedTranscriptRecoveryBannerPresentation? {
+        guard !transcriptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        let baseMessage = "This meeting has transcript text but no word timestamps, so timed playback, segments, and speaker labels are unavailable."
+        if let timestampCapableRerun {
+            return MeetingTimedTranscriptRecoveryBannerPresentation(
+                title: "No timed transcript",
+                message: "\(baseMessage) Rerun with \(timestampCapableRerun.engine.displayName) to try adding timestamps. Speaker labels depend on the captured audio and may be approximate.",
+                action: Action(
+                    title: "Try timed retranscription",
+                    selection: timestampCapableRerun
+                )
+            )
+        }
+
+        if hasRetainedAudio {
+            return MeetingTimedTranscriptRecoveryBannerPresentation(
+                title: "No timed transcript",
+                message: "\(baseMessage) A timestamp-capable engine would be needed to try adding timestamps, but none is available right now.",
+                action: nil
+            )
+        }
+
+        return MeetingTimedTranscriptRecoveryBannerPresentation(
+            title: "No timed transcript",
+            message: "\(baseMessage) Saved audio is no longer available, so MacParakeet cannot rerun the meeting to try adding timestamps.",
+            action: nil
+        )
+    }
+}
+
+struct TranscriptResultView: View {
+    let transcription: Transcription
+    @Bindable var viewModel: TranscriptionViewModel
+    var chatViewModel: TranscriptChatViewModel
+    @Bindable var promptResultsViewModel: PromptResultsViewModel
+    @Bindable var promptsViewModel: PromptsViewModel
+    var onBack: (() -> Void)?
+    var onStartNew: (() -> Void)?
+    var onRetranscribe: ((Transcription, SpeechEngineSelection?) -> Void)?
+    var onSetUpAI: (() -> Void)?
+
+    @AppStorage(UserDefaultsAppRuntimePreferences.transcriptAIContextModeKey)
+    private var transcriptAIContextModeRaw = TranscriptAIContextMode.richTranscript.rawValue
+
+    @State private var backHovered = false
+    @State private var headerExpanded = false
+    @State private var speakerOverviewExpanded = true
+    @State private var copied = false
+    @State private var copiedResultID: UUID?
+    @State private var copiedButtonResultID: UUID?
+    @State private var copiedMessageId: UUID?
+    @State private var hoveredMessageId: UUID?
+    @State private var exportConfirmation: ExportConfirmation?
+    @State private var exportErrorMessage: String?
+    @State private var showingExportOptions = false
+    @State private var selectedExportFormat: TranscriptExportFormat = .txt
+    @State private var transcriptExportOptions = TranscriptExportOptions.default
+    @State private var copiedResetTask: Task<Void, Never>?
+    @State private var resultCopiedResetTask: Task<Void, Never>?
+    @State private var resultButtonCopiedResetTask: Task<Void, Never>?
+    @State private var notesCopied = false
+    @State private var notesCopiedResetTask: Task<Void, Never>?
+    @State private var dismissTask: Task<Void, Never>?
+    @State private var editingTitle = false
+    @State private var titleDraft = ""
+    @State private var editingTranscript = false
+    @State private var transcriptDraft = ""
+    @State private var transcriptEditError: String?
+    @State private var transcriptDisplayMode: TranscriptDisplayMode = .text
+    @State private var transcriptDisplayModeBeforeEdit: TranscriptDisplayMode?
+    /// User-adjustable transcript reading size (Transcript Detail Refresh / U4).
+    /// Persisted; applies to both the Text and Timed reading surfaces.
+    @AppStorage(UserDefaultsAppRuntimePreferences.transcriptFontScaleKey)
+    private var transcriptFontScale: Double = 1.0
+    private static let transcriptFontScaleRange: ClosedRange<Double> = 0.85...1.4
+    private static let transcriptFontScaleStep: Double = 0.1
+    private static let textFindAnchorBaseID = -1_000_000
+    // In-transcript find (Transcript Detail Refresh / U2). The matcher is the
+    // testable `TranscriptFindModel`; this view owns the bar's visibility, the
+    // ordered blocks fed to the model, and the scroll wiring.
+    @State private var findModel = TranscriptFindModel()
+    @State private var findBarVisible = false
+    @State private var findBlocks: [TranscriptFindBlock] = []
+    /// Bumped on every keystroke / navigation so the in-reader `onChange` can
+    /// re-aim `scrollTo` at the current match (even when the cursor index is
+    /// unchanged but the matched block moved).
+    @State private var findScrollToken = 0
+    /// True once find-navigation has taken over the auto-scroll pause, so closing
+    /// the bar resumes playback-follow — without clobbering an unrelated
+    /// manual-scroll pause when find never navigated.
+    @State private var findPausedAutoScroll = false
+    @State private var editingSpeakerId: String?
+    @State private var editingSpeakerContextID: String?
+    @State private var editingSpeakerLabel: String = ""
+    @State private var showConversationPopover = false
+    @State private var hoveredConversationId: UUID?
+    @State private var playerViewModel = MediaPlayerViewModel()
+    @State private var showVideoPanel = false
+    @State private var lastScrolledSegmentMs: Int = -1
+    // Cached transcript data — recomputed only when transcription.id changes, not on every playback tick
+    @State private var cachedSegments: [TranscriptSegment] = []
+    @State private var cachedTurns: [SpeakerTurn] = []
+    @State private var cachedIdentifiedTurns: [IdentifiedSpeakerTurn] = []
+    @State private var cachedHasSpeakers: Bool = false
+    @State private var cachedSpeakerColorMap: [String: Color] = [:]
+    @State private var cachedSpeakerLabelMap: [String: String] = [:]
+    @State private var cachedSegmentStartMs: [Int] = []  // sorted, for binary search
+    @State private var autoScrollPaused = false
+    @State private var scrollPauseTask: Task<Void, Never>?
+    @State private var scrollMonitor: Any?
+    @State private var showPromptLibrary = false
+    @State private var showGeneratePopover = false
+    @State private var retranscriptionConfirmation: RetranscriptionConfirmation?
+    @State private var showingRetranscribeOptions = false
+    @State private var pendingRetranscribePick: RetranscribePick?
+    @State private var pendingDeleteMeetingAudio = false
+    @State private var showingCancelGenerationAlert: UUID?
+    @FocusState private var chatInputFocused: Bool
+    @FocusState private var titleFocused: Bool
+    @FocusState private var transcriptEditorFocused: Bool
+    @FocusState private var speakerRenameFocused: Bool
+    @FocusState private var findFieldFocused: Bool
+
+    private let suggestedPrompts = [
+        "Summarize the key points",
+        "What are the main takeaways?",
+        "List any action items mentioned",
+    ]
+
+    var body: some View {
+        adaptiveLayout
+        .onAppear {
+            // Lazy migration for existing webm/opus YouTube audio files
+            // saved before issue #237's playback fix shipped. The VM
+            // transcodes in the background; this callback persists the new
+            // .m4a path so the next open hits it directly.
+            playerViewModel.onPlaybackFilePathConverted = { [viewModel] id, newPath, sourcePath in
+                try viewModel.applyConvertedPlaybackPath(
+                    transcriptionID: id,
+                    newFilePath: newPath,
+                    sourceFileToCleanup: sourcePath
+                )
+            }
+            Task {
+                if showVideoPanel {
+                    await playerViewModel.load(for: transcription)
+                } else {
+                    await playerViewModel.prepare(for: transcription)
+                }
+                if let words = transcription.wordTimestamps, !words.isEmpty {
+                    playerViewModel.loadSubtitleCues(from: words)
+                }
+            }
+            rebuildSegmentCache()
+            viewModel.loadPersistedContent()
+            syncTranscriptDisplayMode()
+            promptResultsViewModel.loadVisiblePrompts()
+            promptResultsViewModel.loadPromptResults(transcriptionId: transcription.id)
+            let text = currentAIContextText
+            chatViewModel.loadTranscript(text, transcriptionId: viewModel.currentTranscription?.id)
+            // Feed the user's typed meeting notes (if any) into chat alongside
+            // the transcript. The closure is re-evaluated on every chat-send so
+            // a CLI edit to userNotes in another process is visible to the next
+            // chat turn without having to reload the page.
+            chatViewModel.bindUserNotesProvider { [viewModel] in
+                viewModel.currentTranscription?.userNotes
+            }
+        }
+        .onChange(of: transcription.id) {
+            Task {
+                playerViewModel.cleanup()
+                if showVideoPanel {
+                    await playerViewModel.load(for: transcription)
+                } else {
+                    await playerViewModel.prepare(for: transcription)
+                }
+                if let words = transcription.wordTimestamps, !words.isEmpty {
+                    playerViewModel.loadSubtitleCues(from: words)
+                }
+            }
+            rebuildSegmentCache()
+            headerExpanded = false
+            speakerOverviewExpanded = true
+            editingTitle = false
+            titleDraft = ""
+            editingTranscript = false
+            transcriptDraft = ""
+            transcriptEditError = nil
+            transcriptDisplayModeBeforeEdit = nil
+            editingSpeakerId = nil
+            editingSpeakerLabel = ""
+            showConversationPopover = false
+            hoveredConversationId = nil
+            lastScrolledSegmentMs = -1
+            autoScrollPaused = false
+            scrollPauseTask?.cancel()
+            // Reset find for the new transcript (no animation during the swap).
+            findBarVisible = false
+            findFieldFocused = false
+            findModel.clear()
+            findBlocks = []
+            findPausedAutoScroll = false
+            viewModel.hasConversations = false
+            viewModel.selectedTab = .transcript
+            viewModel.loadPersistedContent()
+            syncTranscriptDisplayMode()
+            promptResultsViewModel.loadPromptResults(transcriptionId: transcription.id)
+            let text = currentAIContextText
+            chatViewModel.loadTranscript(text, transcriptionId: viewModel.currentTranscription?.id)
+        }
+        .onChange(of: activeTranscription.speakers) {
+            rebuildSegmentCache()
+            if findBarVisible { rebuildFindBlocks() }
+        }
+        .onChange(of: activeTranscription.wordTimestamps) {
+            rebuildSegmentCache()
+            if findBarVisible { rebuildFindBlocks() }
+        }
+        .onChange(of: activeTranscription.diarizationSegments) {
+            rebuildSegmentCache()
+            if findBarVisible { rebuildFindBlocks() }
+        }
+        .onChange(of: transcriptText) {
+            if findBarVisible { rebuildFindBlocks() }
+        }
+        .onChange(of: transcriptAIContextModeRaw) {
+            chatViewModel.loadTranscript(currentAIContextText, transcriptionId: viewModel.currentTranscription?.id)
+        }
+        .onChange(of: viewModel.selectedTab) {
+            if case .result(let id) = viewModel.selectedTab {
+                promptResultsViewModel.markPromptResultViewed(id)
+            }
+        }
+        .onDisappear {
+            playerViewModel.cleanup()
+            if let monitor = scrollMonitor {
+                NSEvent.removeMonitor(monitor)
+                scrollMonitor = nil
+            }
+            scrollPauseTask?.cancel()
+        }
+        .sheet(isPresented: $showPromptLibrary, onDismiss: {
+            promptsViewModel.loadPrompts()
+            promptResultsViewModel.loadVisiblePrompts()
+        }) {
+            PromptLibraryView(viewModel: promptsViewModel)
+        }
+        .alert(
+            "Delete Result?",
+            isPresented: Binding(
+                get: { promptResultsViewModel.pendingDeletePromptResult != nil },
+                set: { if !$0 { promptResultsViewModel.pendingDeletePromptResult = nil } }
+            )
+        ) {
+            Button("Delete", role: .destructive) {
+                promptResultsViewModel.confirmDelete()
+            }
+            Button("Cancel", role: .cancel) {
+                promptResultsViewModel.pendingDeletePromptResult = nil
+            }
+        } message: {
+            Text("This action cannot be undone.")
+        }
+    }
+
+    @ViewBuilder
+    private var adaptiveLayout: some View {
+        switch playerViewModel.playbackMode {
+        case .video where showVideoPanel:
+            HSplitView {
+                videoInfoColumn
+                    .frame(
+                        minWidth: DesignSystem.Layout.videoPlayerMinWidth,
+                        idealWidth: 480
+                    )
+
+                videoContentColumn
+            }
+        case .video, .audio:
+            // Audio mode OR video with panel hidden — show scrubber bar + full-width content
+            VStack(spacing: 0) {
+                AudioScrubberBar(viewModel: playerViewModel)
+                Divider()
+                fullWidthContentColumn
+            }
+        case .none:
+            fullWidthContentColumn
+        }
+    }
+
+    // MARK: - Video Split Layout (Left Pane)
+
+    /// Left pane in video mode: header card + video player + action bar
+    private var videoInfoColumn: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            resultHeaderCard
+                .padding(.horizontal, DesignSystem.Spacing.md)
+                .padding(.top, DesignSystem.Spacing.md)
+
+            TranscriptionVideoPanel(
+                transcription: transcription,
+                playerViewModel: playerViewModel
+            )
+
+            Spacer(minLength: 0)
+
+            Divider()
+
+            actionBar
+        }
+        .alert(
+            "Export Failed",
+            isPresented: Binding(
+                get: { exportErrorMessage != nil },
+                set: { if !$0 { exportErrorMessage = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) {
+                exportErrorMessage = nil
+            }
+        } message: {
+            Text(exportErrorMessage ?? "Unable to export transcript.")
+        }
+    }
+
+    // MARK: - Video Split Layout (Right Pane)
+
+    /// Right pane in video mode: tabs + content (full height, no header/action bar)
+    private var videoContentColumn: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                if viewModel.showTabs {
+                    tabBar
+                }
+                Spacer(minLength: DesignSystem.Spacing.md)
+
+                HStack {
+                    Button {
+                        withAnimation(DesignSystem.Animation.contentSwap) {
+                            showVideoPanel = false
+                        }
+                    } label: {
+                        Label("Hide Video", systemImage: "rectangle.lefthalf.inset.filled.arrow.left")
+                            .font(DesignSystem.Typography.caption)
+                            .foregroundStyle(DesignSystem.Colors.textSecondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .layoutPriority(1)
+            }
+            .padding(.horizontal, DesignSystem.Spacing.lg)
+            .padding(.top, DesignSystem.Spacing.md)
+
+            contentArea
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .onDisappear {
+            copiedResetTask?.cancel()
+            copiedResetTask = nil
+            resultCopiedResetTask?.cancel()
+            resultCopiedResetTask = nil
+            resultButtonCopiedResetTask?.cancel()
+            resultButtonCopiedResetTask = nil
+            dismissTask?.cancel()
+            dismissTask = nil
+        }
+    }
+
+    // MARK: - Full-Width Layout (No Video, Audio, or Hidden Video)
+
+    /// Single-column layout: header + tabs + content + action bar
+    private var fullWidthContentColumn: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            resultHeaderCard
+                .padding(.horizontal, DesignSystem.Spacing.lg)
+                .padding(.top, DesignSystem.Spacing.lg)
+
+            HStack {
+                if viewModel.showTabs {
+                    tabBar
+                }
+                Spacer(minLength: DesignSystem.Spacing.md)
+
+                HStack {
+                    if playerViewModel.playbackMode == .video && !showVideoPanel {
+                        Button {
+                            withAnimation(DesignSystem.Animation.contentSwap) {
+                                showVideoPanel = true
+                            }
+                            // Lazy-load: extract YouTube stream only when user wants video
+                            if playerViewModel.needsVideoStreamLoad {
+                                Task {
+                                    await playerViewModel.load(for: transcription)
+                                }
+                            }
+                        } label: {
+                            Label("Show Video", systemImage: "play.rectangle")
+                                .font(DesignSystem.Typography.caption)
+                                .foregroundStyle(DesignSystem.Colors.textSecondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .layoutPriority(1)
+            }
+            .padding(.horizontal, DesignSystem.Spacing.lg)
+            .padding(.top, DesignSystem.Spacing.md)
+
+            contentArea
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            Divider()
+
+            actionBar
+        }
+        .alert(
+            "Export Failed",
+            isPresented: Binding(
+                get: { exportErrorMessage != nil },
+                set: { if !$0 { exportErrorMessage = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) {
+                exportErrorMessage = nil
+            }
+        } message: {
+            Text(exportErrorMessage ?? "Unable to export transcript.")
+        }
+        .onDisappear {
+            copiedResetTask?.cancel()
+            copiedResetTask = nil
+            resultCopiedResetTask?.cancel()
+            resultCopiedResetTask = nil
+            resultButtonCopiedResetTask?.cancel()
+            resultButtonCopiedResetTask = nil
+            dismissTask?.cancel()
+            dismissTask = nil
+        }
+    }
+
+    // MARK: - Action Bar
+
+    private var actionBar: some View {
+        HStack(spacing: DesignSystem.Spacing.sm) {
+            Button {
+                copyToClipboard()
+            } label: {
+                Label(
+                    copied ? "Copied!" : "Copy",
+                    systemImage: copied ? "checkmark" : "doc.on.clipboard"
+                )
+                .foregroundStyle(copied ? DesignSystem.Colors.successGreen : .primary)
+            }
+            .parakeetAction(.secondary)
+
+            Button {
+                showingExportOptions.toggle()
+            } label: {
+                Label("Export", systemImage: "arrow.down.doc")
+            }
+            .parakeetAction(.secondary)
+            .popover(isPresented: $showingExportOptions, arrowEdge: .top) {
+                exportOptionsPopover
+            }
+
+            if activeTranscription.sourceType == .meeting {
+                let audioState = MeetingAudioFile.state(for: activeTranscription)
+                let audioAvailable = audioState == .saved
+                let audioRemovable = MeetingAudioFile.isRemovable(for: activeTranscription, state: audioState)
+                Menu {
+                    Button {
+                        MeetingAudioActions.revealInFinder(activeTranscription)
+                    } label: {
+                        Label("Show Audio in Finder", systemImage: "waveform")
+                    }
+                    Button {
+                        saveMeetingAudioFromActionBar()
+                    } label: {
+                        Label("Save Audio As…", systemImage: "square.and.arrow.down")
+                    }
+
+                    Divider()
+
+                    Button(role: .destructive) {
+                        pendingDeleteMeetingAudio = true
+                    } label: {
+                        Label(MeetingDeletionCopy.audioOnlyMenuTitle, systemImage: "waveform.slash")
+                    }
+                    .disabled(!audioRemovable)
+                    .help(audioRemovable
+                          ? "Remove the saved meeting audio while keeping the meeting"
+                          : MeetingDeletionCopy.audioRemovalUnavailableHelp(
+                              for: activeTranscription,
+                              state: audioState
+                          ))
+                } label: {
+                    Label("Audio", systemImage: "waveform")
+                }
+                .parakeetAction(.secondary)
+                .disabled(!audioAvailable)
+                .help(audioAvailable
+                      ? "Reveal or save the meeting audio file"
+                      : MeetingDeletionCopy.audioUnavailableHelp(for: audioState))
+
+                let artifactAvailable = MeetingArtifactActions.folderURL(for: activeTranscription) != nil
+                Menu {
+                    Button {
+                        MeetingArtifactActions.openFolder(for: activeTranscription)
+                    } label: {
+                        Label("Open Meeting Folder", systemImage: "folder")
+                    }
+
+                    Button {
+                        MeetingArtifactActions.copyFolderPath(for: activeTranscription)
+                    } label: {
+                        Label("Copy Artifact Folder Path", systemImage: "doc.on.doc")
+                    }
+                } label: {
+                    Label("Artifacts", systemImage: "folder")
+                }
+                .parakeetAction(.secondary)
+                .disabled(!artifactAvailable)
+                .help(artifactAvailable
+                      ? "Open or copy the meeting artifact folder path"
+                      : "Meeting artifact folder is not available")
+            }
+
+            if onRetranscribe != nil, let filePath = transcription.filePath,
+               FileManager.default.fileExists(atPath: filePath) {
+                let engineOption = viewModel.retranscriptionEngineOption(for: transcription)
+                Button {
+                    if engineOption != nil {
+                        showingRetranscribeOptions.toggle()
+                    } else {
+                        retranscriptionConfirmation = RetranscriptionConfirmation(
+                            transcriptionID: transcription.id,
+                            speechEngineOverride: nil
+                        )
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "arrow.trianglehead.2.clockwise")
+                        Text("Retranscribe")
+                        if engineOption != nil {
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                                .padding(.leading, 2)
+                        }
+                    }
+                }
+                .parakeetAction(.secondary)
+                .help(engineOption != nil ? "Choose a speech engine for this rerun" : "Retranscribe this file")
+                .popover(isPresented: $showingRetranscribeOptions, arrowEdge: .top) {
+                    if let engineOption {
+                        retranscribeOptionsPopover(for: engineOption)
+                    }
+                }
+            }
+
+            Spacer()
+
+            if let onStartNew {
+                Button {
+                    onStartNew()
+                } label: {
+                    Label("New Transcription", systemImage: "plus")
+                }
+                .parakeetAction(.primary)
+            }
+        }
+        .padding(DesignSystem.Spacing.md)
+        .onChange(of: showingRetranscribeOptions) { _, isOpen in
+            // Picker → alert handoff: the picker popover stores the user's
+            // choice in `pendingRetranscribePick` then closes itself. We hop
+            // through Task { @MainActor } so the popover-dismiss render
+            // cycle finishes before the alert tries to present — without the
+            // hop, SwiftUI on macOS reliably drops the alert.
+            guard !isOpen, let pick = pendingRetranscribePick else { return }
+            pendingRetranscribePick = nil
+            Task { @MainActor in
+                retranscriptionConfirmation = RetranscriptionConfirmation(
+                    transcriptionID: pick.transcriptionID,
+                    speechEngineOverride: pick.override
+                )
+            }
+        }
+        .onChange(of: transcription.id) {
+            pendingRetranscribePick = nil
+            retranscriptionConfirmation = nil
+            showingRetranscribeOptions = false
+        }
+        .alert(
+            retranscriptionConfirmation?.title ?? "Retranscribe this file?",
+            isPresented: isRetranscriptionConfirmationPresented,
+            presenting: retranscriptionConfirmation
+        ) { confirmation in
+            Button(confirmation.confirmLabel, role: .destructive) {
+                guard confirmation.transcriptionID == transcription.id else { return }
+                onRetranscribe?(activeTranscription, confirmation.speechEngineOverride)
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: { confirmation in
+            Text(confirmation.message)
+        }
+        .alert(MeetingDeletionCopy.audioOnlyAlertTitle, isPresented: $pendingDeleteMeetingAudio) {
+            Button("Cancel", role: .cancel) {}
+            Button(MeetingDeletionCopy.audioOnlyConfirmTitle, role: .destructive) {
+                deleteMeetingAudioFromActionBar()
+            }
+        } message: {
+            Text(
+                MeetingDeletionCopy.singleAudioOnlyMessage(
+                    surface: .library,
+                    status: activeTranscription.status
+                )
+            )
+        }
+        .popover(item: $exportConfirmation, arrowEdge: .top) { confirmation in
+            exportConfirmationPopover(confirmation)
+        }
+    }
+
+    private var isRetranscriptionConfirmationPresented: Binding<Bool> {
+        Binding(
+            get: { retranscriptionConfirmation?.transcriptionID == transcription.id },
+            set: { isPresented in
+                if !isPresented {
+                    retranscriptionConfirmation = nil
+                }
+            }
+        )
+    }
+
+    private func retranscribeOptionsPopover(
+        for option: TranscriptionViewModel.RetranscriptionEngineOption
+    ) -> some View {
+        VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
+            HStack(spacing: DesignSystem.Spacing.sm) {
+                Label("Retranscribe with", systemImage: "arrow.trianglehead.2.clockwise")
+                    .font(DesignSystem.Typography.body.weight(.semibold))
+                    .foregroundStyle(DesignSystem.Colors.textPrimary)
+
+                Spacer(minLength: 8)
+
+                Button {
+                    showingRetranscribeOptions = false
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close retranscribe options")
+            }
+
+            VStack(spacing: DesignSystem.Spacing.sm) {
+                ForEach(option.choices) { choice in
+                    EngineOptionCard(
+                        selection: choice.selection,
+                        nemotronVariant: option.nemotronVariant,
+                        parakeetVariant: option.parakeetVariant,
+                        isPrimary: choice.isPrimary,
+                        primaryReflectsTranscriptEngine: option.primaryReflectsTranscriptEngine,
+                        isAvailable: choice.isAvailable,
+                        unavailableReason: choice.unavailableReason,
+                        advisory: choice.advisory
+                    ) {
+                        selectRetranscribeEngine(
+                            choice,
+                            reflectsTranscriptEngine: option.primaryReflectsTranscriptEngine
+                        )
+                    }
+                }
+            }
+
+            Text("Replaces this transcript. Prompts and chats are preserved.")
+                .font(DesignSystem.Typography.caption)
+                .foregroundStyle(DesignSystem.Colors.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(DesignSystem.Spacing.md)
+        .frame(width: 390)
+    }
+
+    private func selectRetranscribeEngine(
+        _ choice: TranscriptionViewModel.RetranscriptionEngineOption.Choice,
+        reflectsTranscriptEngine: Bool
+    ) {
+        // Pin the engine named on the card whenever it is a specific choice — an
+        // alternative engine, or the engine that actually produced this
+        // transcript. Only the legacy "Current" primary (a fall-back to the
+        // user's Final Transcription default) reruns through the plain
+        // current-settings path, so its variant and language follow whatever
+        // the user has set now.
+        let override: SpeechEngineSelection? =
+            (choice.isPrimary && !reflectsTranscriptEngine) ? nil : choice.selection
+        pendingRetranscribePick = RetranscribePick(transcriptionID: transcription.id, override: override)
+        showingRetranscribeOptions = false
+        // Confirmation alert is presented from the .onChange handler that
+        // observes showingRetranscribeOptions flipping to false — see actionBar.
+    }
+
+    private var activeTranscription: Transcription {
+        guard let current = viewModel.currentTranscription, current.id == transcription.id else {
+            return transcription
+        }
+        return current
+    }
+
+    private var transcriptText: String {
+        activeTranscription.cleanTranscript ?? activeTranscription.rawTranscript ?? ""
+    }
+
+    private var currentAIContextMode: TranscriptAIContextMode {
+        TranscriptAIContextMode(rawValue: transcriptAIContextModeRaw) ?? .richTranscript
+    }
+
+    private var currentAIContextText: String {
+        TranscriptAIContextFormatter.format(
+            transcription: activeTranscription,
+            mode: currentAIContextMode
+        )
+    }
+
+    private var rawTranscriptText: String {
+        activeTranscription.rawTranscript ?? ""
+    }
+
+    private var hasEditedTranscript: Bool {
+        activeTranscription.isTranscriptEdited && hasCleanTranscriptText
+    }
+
+    private var hasCleanTranscriptText: Bool {
+        guard let clean = activeTranscription.cleanTranscript else { return false }
+        return !clean.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var transcriptWordCount: Int {
+        if transcriptDisplayMode == .timed,
+           let wordTimestamps = activeTranscription.wordTimestamps, !wordTimestamps.isEmpty {
+            return wordTimestamps.count
+        }
+        return transcriptText.split(whereSeparator: \.isWhitespace).count
+    }
+
+    private var speakerCountValue: Int {
+        activeTranscription.speakers?.count ?? activeTranscription.speakerCount ?? 0
+    }
+
+    /// User-facing engine attribution string for the metadata chip, or `nil`
+    /// for legacy rows saved before the v0.8 engine-attribution migration —
+    /// in that case we omit the chip rather than mislabel.
+    private var engineAttributionLabel: String? {
+        guard let engineRaw = activeTranscription.engine,
+              let preference = SpeechEnginePreference(rawValue: engineRaw) else {
+            return nil
+        }
+        switch preference {
+        case .parakeet:
+            return "Parakeet TDT"
+        case .nemotron:
+            // Variant-aware: the EN build is not "Nemotron 3.5". Legacy rows
+            // (nil/multilingual variant) keep the established label.
+            if activeTranscription.engineVariant == NemotronModelVariant.english1120.rawValue {
+                return "Nemotron EN Beta"
+            }
+            return "Nemotron 3.5 Beta"
+        case .whisper:
+            guard let variant = activeTranscription.engineVariant else {
+                return "Whisper"
+            }
+            return "Whisper \(SpeechEnginePreference.friendlyVariantName(variant))"
+        case .cohere:
+            return "Cohere Transcribe"
+        }
+    }
+
+    private var resultHeaderCard: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Always-visible compact row: back button + title + metadata + mandala + expand toggle
+            HStack(alignment: .center, spacing: DesignSystem.Spacing.sm) {
+                if let onBack {
+                    Button(action: onBack) {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(backHovered ? DesignSystem.Colors.accent : DesignSystem.Colors.textPrimary)
+                            .frame(width: 36, height: 36)
+                            .background(
+                                Circle()
+                                    .fill(backHovered ? DesignSystem.Colors.accent.opacity(0.12) : DesignSystem.Colors.surfaceElevated)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { hovering in
+                        withAnimation(DesignSystem.Animation.hoverTransition) {
+                            backHovered = hovering
+                        }
+                    }
+                    .accessibilityLabel("Back")
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    titleView
+
+                    if !headerExpanded {
+                        // Inline metadata in collapsed mode
+                        HStack(spacing: 6) {
+                            metadataChip(
+                                icon: sourceChipIcon,
+                                text: sourceChipText,
+                                tint: sourceChipTint,
+                                symbolText: sourceChipSymbolText
+                            )
+
+                            if let durationMs = transcription.durationMs {
+                                metadataChip(icon: "clock", text: durationMs.formattedDuration, tint: DesignSystem.Colors.textSecondary)
+                            }
+
+                            if transcriptWordCount > 0 {
+                                metadataChip(icon: "text.word.spacing", text: "\(transcriptWordCount.formatted()) words", tint: DesignSystem.Colors.textSecondary)
+                            }
+
+                            if speakerCountValue > 0 {
+                                metadataChip(icon: "person.2.fill", text: "\(speakerCountValue) speaker\(speakerCountValue == 1 ? "" : "s")", tint: DesignSystem.Colors.textSecondary)
+                            }
+                        }
+                    }
+                }
+
+                Spacer(minLength: DesignSystem.Spacing.sm)
+
+                SonicMandalaView(
+                    data: mandalaData,
+                    size: headerExpanded ? 56 : 40,
+                    style: .fullColor
+                )
+
+                // Expand/collapse chevron
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(DesignSystem.Colors.textTertiary)
+                    .rotationEffect(.degrees(headerExpanded ? 180 : 0))
+            }
+            .padding(.horizontal, DesignSystem.Spacing.md)
+            .padding(.vertical, DesignSystem.Spacing.sm)
+
+            // Expanded details section
+            if headerExpanded {
+                VStack(alignment: .leading, spacing: DesignSystem.Spacing.sm) {
+                    HStack(spacing: DesignSystem.Spacing.sm) {
+                        metadataChip(
+                            icon: sourceChipIcon,
+                            text: expandedSourceChipText,
+                            tint: sourceChipTint,
+                            symbolText: sourceChipSymbolText
+                        )
+
+                        if let durationMs = transcription.durationMs {
+                            metadataChip(icon: "clock", text: durationMs.formattedDuration, tint: DesignSystem.Colors.textSecondary)
+                        }
+
+                        if transcriptWordCount > 0 {
+                            metadataChip(icon: "text.word.spacing", text: "\(transcriptWordCount.formatted()) words", tint: DesignSystem.Colors.textSecondary)
+                        }
+
+                        if speakerCountValue > 0 {
+                            metadataChip(icon: "person.2.fill", text: "\(speakerCountValue) speaker\(speakerCountValue == 1 ? "" : "s")", tint: DesignSystem.Colors.textSecondary)
+                        }
+
+                        if let engineAttributionLabel {
+                            metadataChip(icon: "cpu", text: engineAttributionLabel, tint: DesignSystem.Colors.textSecondary)
+                        }
+                    }
+
+                    if let sourceURL = transcription.sourceURL,
+                       let url = URL(string: sourceURL) {
+                        Button {
+                            NSWorkspace.shared.open(url)
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "link")
+                                    .font(.system(size: 10, weight: .semibold))
+                                Text(sourceURL)
+                                    .font(DesignSystem.Typography.caption)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Image(systemName: "arrow.up.right")
+                                    .font(.system(size: 9, weight: .semibold))
+                            }
+                            .foregroundStyle(DesignSystem.Colors.textSecondary)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .fill(DesignSystem.Colors.surface)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .onHover { hovering in
+                            if hovering {
+                                NSCursor.pointingHand.push()
+                            } else {
+                                NSCursor.pop()
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, DesignSystem.Spacing.md)
+                .padding(.bottom, DesignSystem.Spacing.sm)
+                .padding(.leading, onBack != nil ? 36 + DesignSystem.Spacing.sm : 0)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                headerExpanded.toggle()
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: DesignSystem.Layout.cardCornerRadius)
+                .fill(DesignSystem.Colors.cardBackground)
+                .cardShadow(DesignSystem.Shadows.cardRest)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DesignSystem.Layout.cardCornerRadius)
+                .strokeBorder(DesignSystem.Colors.border.opacity(0.75), lineWidth: 0.5)
+        )
+    }
+
+    @ViewBuilder
+    private var titleView: some View {
+        if editingTitle {
+            HStack(spacing: 8) {
+                TextField("Title", text: $titleDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .font(headerExpanded ? DesignSystem.Typography.pageTitle : DesignSystem.Typography.sectionTitle)
+                    .focused($titleFocused)
+                    .onSubmit(commitTitleRename)
+
+                Button(action: commitTitleRename) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(DesignSystem.Colors.successGreen)
+                }
+                .buttonStyle(.plain)
+
+                Button(action: cancelTitleRename) {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(DesignSystem.Colors.textTertiary)
+                }
+                .buttonStyle(.plain)
+            }
+        } else {
+            HStack(spacing: 8) {
+                Text(displayedTitle)
+                    .font(headerExpanded ? DesignSystem.Typography.pageTitle : DesignSystem.Typography.sectionTitle)
+                    .foregroundStyle(DesignSystem.Colors.textPrimary)
+                    .lineLimit(headerExpanded ? 3 : 1)
+
+                if canRenameTitle {
+                    Button(action: beginTitleRename) {
+                        Image(systemName: "pencil")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(DesignSystem.Colors.textTertiary)
+                    }
+                    .buttonStyle(.plain)
+                    .help(transcription.sourceType == .meeting ? "Rename meeting" : "Rename transcription")
+                }
+
+                if transcription.recoveredFromCrash {
+                    metadataChip(
+                        icon: "wrench.and.screwdriver",
+                        text: "Recovered",
+                        tint: DesignSystem.Colors.warningAmber
+                    )
+                }
+            }
+        }
+    }
+
+    private var sourceDisplay: TranscriptionSourceDisplay {
+        TranscriptionSourceDisplay.resolve(for: transcription)
+    }
+
+    private var sourceChipIcon: String {
+        sourceDisplay.systemImage
+    }
+
+    private var sourceChipSymbolText: String? {
+        sourceDisplay.symbolText
+    }
+
+    private var sourceChipText: String {
+        sourceDisplay.collapsedText
+    }
+
+    private var expandedSourceChipText: String {
+        sourceDisplay.expandedText
+    }
+
+    private var sourceChipTint: Color {
+        sourceDisplay.tint
+    }
+
+    private var displayedTitle: String {
+        (viewModel.currentTranscription ?? transcription).effectiveDisplayTitle
+    }
+
+    private var canRenameTitle: Bool {
+        transcription.sourceType == .meeting || transcription.sourceType == .file
+    }
+
+    private func beginTitleRename() {
+        titleDraft = displayedTitle
+        editingTitle = true
+        Task { @MainActor in
+            titleFocused = true
+        }
+    }
+
+    private func cancelTitleRename() {
+        editingTitle = false
+        titleDraft = ""
+    }
+
+    private func commitTitleRename() {
+        if transcription.sourceType == .meeting {
+            viewModel.renameCurrentTranscription(to: titleDraft)
+        } else if transcription.sourceType == .file {
+            viewModel.renameCurrentTranscriptionTitle(to: titleDraft)
+        }
+        editingTitle = false
+    }
+
+    private func metadataChip(icon: String, text: String, tint: Color, symbolText: String? = nil) -> some View {
+        HStack(spacing: 6) {
+            if let symbolText {
+                Text(symbolText)
+                    .font(.system(size: 10, weight: .bold))
+            } else {
+                Image(systemName: icon)
+                    .font(.system(size: 10, weight: .semibold))
+            }
+            Text(text)
+                .font(DesignSystem.Typography.caption.weight(.medium))
+        }
+        .foregroundStyle(tint)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            Capsule()
+                .fill(tint.opacity(0.10))
+        )
+    }
+
+    @ViewBuilder
+    private var contentArea: some View {
+        Group {
+            if viewModel.showTabs {
+                switch viewModel.selectedTab {
+                case .transcript:
+                    transcriptPane
+                case .result(let id):
+                    if promptResultsViewModel.promptResults.contains(where: { $0.id == id }) {
+                        promptResultContentPane(promptResultID: id)
+                    } else {
+                        transcriptPane
+                            .onAppear { viewModel.selectedTab = .transcript }
+                    }
+                case .generation(let id):
+                    if promptResultsViewModel.pendingGeneration(id: id) != nil {
+                        pendingGenerationPane(generationID: id)
+                    } else {
+                        transcriptPane
+                            .onAppear { viewModel.selectedTab = .transcript }
+                    }
+                case .chat:
+                    chatPane(viewModel: chatViewModel)
+                }
+            } else {
+                transcriptPane
+            }
+        }
+        .padding(DesignSystem.Spacing.lg)
+    }
+
+    private var transcriptPane: some View {
+        VStack(spacing: 0) {
+            if findBarVisible {
+                transcriptFindToolbar
+            }
+            ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
+                    transcriptPaneHeader
+
+                    if activeTranscription.sourceType == .meeting,
+                       !activeTranscription.hasWordTimestamps,
+                       let banner = meetingNoWordTimestampsBannerPresentation {
+                        meetingNoWordTimestampsBanner(banner)
+                    }
+
+                    if shouldShowTranscriptAISetupBanner {
+                        chatConfigurationBanner
+                    }
+
+                    if let userNotes = activeTranscription.userNotes,
+                       !userNotes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        meetingNotesSection(userNotes)
+                    }
+
+                    if let error = transcriptEditError {
+                        Label(error, systemImage: "exclamationmark.triangle.fill")
+                            .font(DesignSystem.Typography.caption)
+                            .foregroundStyle(DesignSystem.Colors.errorRed)
+                    }
+
+                    if editingTranscript {
+                        transcriptEditor
+                    } else if transcriptDisplayMode == .timed,
+                              let timestamps = activeTranscription.wordTimestamps,
+                              !timestamps.isEmpty {
+                        if let speakers = activeTranscription.speakers, !speakers.isEmpty {
+                            speakerSummaryPanel(speakers: speakers)
+                        }
+                        timestampedView(words: timestamps)
+                    } else if !transcriptText.isEmpty {
+                        transcriptTextBlock
+                    } else {
+                        Text("No transcript available")
+                            .foregroundStyle(DesignSystem.Colors.textSecondary)
+                    }
+                }
+                .padding(DesignSystem.Spacing.lg)
+            }
+            .onChange(of: playerViewModel.currentTimeMs) { oldValue, newValue in
+                guard playerViewModel.isPlaying else { return }
+                // Detect seek (large time jump) — re-sync transcript regardless of pause state
+                if autoScrollPaused && abs(newValue - oldValue) > 2000 {
+                    autoScrollPaused = false
+                    scrollPauseTask?.cancel()
+                    lastScrolledSegmentMs = -1
+                }
+                guard !autoScrollPaused else { return }
+                guard !cachedSegments.isEmpty else { return }
+                if let targetId = autoScrollTarget(for: newValue),
+                   targetId != lastScrolledSegmentMs {
+                    lastScrolledSegmentMs = targetId
+                    withAnimation(.easeInOut(duration: 0.3)) {
+                        proxy.scrollTo(targetId, anchor: .center)
+                    }
+                }
+            }
+            // Find navigation: scroll the current match into view. Pausing
+            // auto-scroll keeps playback-follow from yanking the view back.
+            .onChange(of: findScrollToken) {
+                guard findBarVisible, let target = findCurrentScrollTargetID else { return }
+                autoScrollPaused = true
+                findPausedAutoScroll = true
+                scrollPauseTask?.cancel()
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    proxy.scrollTo(target, anchor: .center)
+                }
+            }
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: DesignSystem.Layout.cardCornerRadius)
+                .fill(DesignSystem.Colors.surface)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DesignSystem.Layout.cardCornerRadius)
+                .strokeBorder(DesignSystem.Colors.border.opacity(0.75), lineWidth: 0.5)
+        )
+        .background { transcriptFindShortcuts }
+        .onChange(of: transcriptDisplayMode) {
+            if findBarVisible { rebuildFindBlocks() }
+        }
+        .onChange(of: editingTranscript) {
+            if editingTranscript, findBarVisible { closeFindBar() }
+        }
+        .onAppear {
+            if let existing = scrollMonitor {
+                NSEvent.removeMonitor(existing)
+            }
+            scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
+                if self.playerViewModel.isPlaying {
+                    if self.findPausedAutoScroll {
+                        // Manual scroll takes ownership and should start the
+                        // normal bounded pause below, not inherit find's pause.
+                        self.findPausedAutoScroll = false
+                        self.autoScrollPaused = false
+                        self.scrollPauseTask?.cancel()
+                    }
+                    if !self.autoScrollPaused {
+                        self.autoScrollPaused = true
+                        self.lastScrolledSegmentMs = -1
+                    }
+                    self.scrollPauseTask?.cancel()
+                    self.scrollPauseTask = Task { @MainActor in
+                        try? await Task.sleep(for: .seconds(5))
+                        if !Task.isCancelled {
+                            self.autoScrollPaused = false
+                        }
+                    }
+                }
+                return event
+            }
+        }
+        .onDisappear {
+            if let monitor = scrollMonitor {
+                NSEvent.removeMonitor(monitor)
+                scrollMonitor = nil
+            }
+            scrollPauseTask?.cancel()
+            autoScrollPaused = false
+        }
+    }
+
+    // MARK: - In-transcript find (U2)
+
+    /// Pinned find toolbar at the top of the reading pane. Stays visible while
+    /// scrolling (unlike a row inside the ScrollView) and never overlaps the
+    /// header controls (unlike a floating overlay).
+    private var transcriptFindToolbar: some View {
+        HStack {
+            Spacer()
+            transcriptFindBar
+        }
+        .padding(.horizontal, DesignSystem.Spacing.lg)
+        .padding(.top, DesignSystem.Spacing.md)
+        .padding(.bottom, DesignSystem.Spacing.sm)
+        .transition(.move(edge: .top).combined(with: .opacity))
+    }
+
+    private var transcriptFindBar: some View {
+        TranscriptFindBar(
+            query: Binding(
+                get: { findModel.query },
+                set: { setFindQuery($0) }
+            ),
+            isFocused: $findFieldFocused,
+            position: findModel.displayPosition,
+            hasQueryButNoMatches: findHasQueryNoMatches,
+            onNext: { findModel.next(); findScrollToken &+= 1 },
+            onPrev: { findModel.prev(); findScrollToken &+= 1 },
+            onClose: closeFindBar
+        )
+    }
+
+    /// Hidden buttons that register ⌘F / ⌘G / ⇧⌘G while the transcript pane is
+    /// in the hierarchy. ⌘G stepping is gated on an open bar with live matches.
+    private var transcriptFindShortcuts: some View {
+        ZStack {
+            Button("") { openFindBar() }
+                .keyboardShortcut("f", modifiers: .command)
+            if findBarVisible, findModel.hasMatches {
+                Button("") { findModel.next(); findScrollToken &+= 1 }
+                    .keyboardShortcut("g", modifiers: .command)
+                Button("") { findModel.prev(); findScrollToken &+= 1 }
+                    .keyboardShortcut("g", modifiers: [.command, .shift])
+            }
+        }
+        .opacity(0)
+        .frame(width: 0, height: 0)
+        .accessibilityHidden(true)
+    }
+
+    /// Match ranges to wash in the reading surface, keyed by block `id`
+    /// (segment `startMs` in Timed mode, paragraph line index in Text mode).
+    private var findHighlightsByBlockId: [Int: [NSRange]] {
+        guard findBarVisible, !findModel.matches.isEmpty, !findBlocks.isEmpty else { return [:] }
+        var dict: [Int: [NSRange]] = [:]
+        for match in findModel.matches where findBlocks.indices.contains(match.blockIndex) {
+            dict[findBlocks[match.blockIndex].id, default: []].append(match.range)
+        }
+        return dict
+    }
+
+    /// The single emphasized match, resolved to its block's scroll `id`.
+    private var findCurrentHighlight: (id: Int, range: NSRange)? {
+        guard findBarVisible, let current = findModel.current,
+              findBlocks.indices.contains(current.blockIndex) else { return nil }
+        return (id: findBlocks[current.blockIndex].id, range: current.range)
+    }
+
+    /// The scroll target for the current match. Timed mode scrolls to the
+    /// owning segment. Text mode keeps one selectable transcript body, so it
+    /// scrolls to the hidden prefix anchor for the current match range.
+    private var findCurrentScrollTargetID: Int? {
+        guard findBarVisible, let current = findModel.current,
+              findBlocks.indices.contains(current.blockIndex) else { return nil }
+        if transcriptDisplayMode == .text {
+            return currentTextFindAnchor?.id
+        }
+        return findBlocks[current.blockIndex].id
+    }
+
+    private var findFullTextHighlightRanges: [NSRange] {
+        guard findBarVisible, transcriptDisplayMode == .text, !findModel.matches.isEmpty else { return [] }
+        return findModel.matches.map(\.range)
+    }
+
+    private var findFullTextCurrentHighlightRange: NSRange? {
+        guard findBarVisible, transcriptDisplayMode == .text else { return nil }
+        return findModel.current?.range
+    }
+
+    private var findHasQueryNoMatches: Bool {
+        findBarVisible
+            && !findModel.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !findModel.hasMatches
+    }
+
+    private func openFindBar() {
+        // Find is a reading affordance; editing uses the raw text editor.
+        guard !editingTranscript else { return }
+        if !findBarVisible {
+            withAnimation(DesignSystem.Animation.contentSwap) { findBarVisible = true }
+        }
+        rebuildFindBlocks()
+        Task { @MainActor in findFieldFocused = true }
+    }
+
+    private func closeFindBar() {
+        withAnimation(DesignSystem.Animation.contentSwap) { findBarVisible = false }
+        findFieldFocused = false
+        findModel.clear()
+        findBlocks = []
+        releaseFindOwnedAutoScrollPause()
+    }
+
+    /// Resume playback-follow only if find navigation owns the pause; manual
+    /// scroll pauses keep their normal 5-second lifetime.
+    private func releaseFindOwnedAutoScrollPause() {
+        if findPausedAutoScroll {
+            autoScrollPaused = false
+            scrollPauseTask?.cancel()
+            findPausedAutoScroll = false
+        }
+    }
+
+    private func setFindQuery(_ newValue: String) {
+        findModel.setQuery(newValue)
+        if !findModel.hasMatches {
+            releaseFindOwnedAutoScrollPause()
+        }
+        findScrollToken &+= 1
+    }
+
+    /// Rebuild the ordered blocks the matcher searches for the current mode and
+    /// re-run the live query. Timed mode searches cached segments. Text mode
+    /// searches the full transcript string so native selection can span line and
+    /// paragraph breaks; the current-match scroll anchor is derived on demand.
+    private func rebuildFindBlocks() {
+        guard findBarVisible, !editingTranscript else {
+            findBlocks = []
+            findModel.setBlocks([])
+            releaseFindOwnedAutoScrollPause()
+            return
+        }
+        let blocks: [TranscriptFindBlock]
+        if transcriptDisplayMode == .timed, hasTimestamps {
+            blocks = cachedSegments.map { TranscriptFindBlock(id: $0.startMs, text: $0.text) }
+        } else {
+            blocks = [TranscriptFindBlock(id: 0, text: transcriptText)]
+        }
+        findBlocks = blocks
+        findModel.setBlocks(blocks.map(\.text))
+        if findModel.hasMatches {
+            findScrollToken &+= 1
+        } else {
+            releaseFindOwnedAutoScrollPause()
+        }
+    }
+
+    private var currentTextFindAnchor: TranscriptTextFindAnchor? {
+        guard findBarVisible, transcriptDisplayMode == .text,
+              let current = findModel.current else { return nil }
+        guard let prefixEnd = transcriptText.stringIndex(utf16Offset: current.range.location) else {
+            return nil
+        }
+        return TranscriptTextFindAnchor(
+            id: Self.textFindAnchorBaseID,
+            prefixText: String(transcriptText[..<prefixEnd])
+        )
+    }
+
+    /// Persisted scale clamped to the supported range, so a stale or externally
+    /// written `transcriptFontScale` never renders the body at an out-of-range
+    /// size before the user touches A−/A+.
+    private var clampedTranscriptFontScale: Double {
+        min(
+            max(transcriptFontScale, Self.transcriptFontScaleRange.lowerBound),
+            Self.transcriptFontScaleRange.upperBound
+        )
+    }
+
+    /// Transcript body font at the current user reading scale (U4).
+    private var scaledTranscriptFont: Font {
+        DesignSystem.Typography.transcriptBody(scale: clampedTranscriptFontScale)
+    }
+
+    private func adjustTranscriptFontScale(by delta: Double) {
+        let next = clampedTranscriptFontScale + delta
+        transcriptFontScale = min(
+            max(next, Self.transcriptFontScaleRange.lowerBound),
+            Self.transcriptFontScaleRange.upperBound
+        )
+    }
+
+    /// Compact A−/A+ control for the transcript reading size. Lives in the pane
+    /// header; hidden while editing (editing uses the raw text editor).
+    private var transcriptFontSizeControl: some View {
+        HStack(spacing: 2) {
+            Button {
+                adjustTranscriptFontScale(by: -Self.transcriptFontScaleStep)
+            } label: {
+                Image(systemName: "textformat.size.smaller")
+                    .font(.system(size: 13, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .disabled(clampedTranscriptFontScale <= Self.transcriptFontScaleRange.lowerBound + 0.001)
+            .help("Smaller transcript text")
+            .accessibilityLabel("Smaller transcript text")
+
+            Button {
+                adjustTranscriptFontScale(by: Self.transcriptFontScaleStep)
+            } label: {
+                Image(systemName: "textformat.size.larger")
+                    .font(.system(size: 13, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .disabled(clampedTranscriptFontScale >= Self.transcriptFontScaleRange.upperBound - 0.001)
+            .help("Larger transcript text")
+            .accessibilityLabel("Larger transcript text")
+        }
+        .foregroundStyle(DesignSystem.Colors.textSecondary)
+    }
+
+    private var transcriptPaneHeader: some View {
+        HStack(spacing: DesignSystem.Spacing.sm) {
+            Label("Transcript", systemImage: "text.alignleft")
+                .font(DesignSystem.Typography.sectionTitle)
+                .foregroundStyle(DesignSystem.Colors.textPrimary)
+
+            if hasEditedTranscript {
+                Label("Edited", systemImage: "checkmark.circle.fill")
+                    .font(DesignSystem.Typography.caption)
+                    .foregroundStyle(DesignSystem.Colors.successGreen)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule().fill(DesignSystem.Colors.successGreen.opacity(0.10))
+                    )
+            }
+
+            Spacer()
+
+            // Show whenever word timestamps exist: Timed renders from word data,
+            // and Text falls back to the raw transcript when clean text is absent.
+            if !editingTranscript, hasTimestamps {
+                Picker("Transcript view", selection: $transcriptDisplayMode) {
+                    ForEach(TranscriptDisplayMode.allCases, id: \.self) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 150)
+            }
+
+            if !editingTranscript {
+                transcriptFontSizeControl
+            }
+
+            if editingTranscript {
+                if hasEditedTranscript {
+                    Button {
+                        revertTranscriptEdit()
+                    } label: {
+                        Label("Revert", systemImage: "arrow.uturn.backward")
+                    }
+                    .parakeetAction(.secondary)
+                }
+
+                Button {
+                    cancelTranscriptEdit()
+                } label: {
+                    Label("Cancel", systemImage: "xmark")
+                }
+                .parakeetAction(.secondary)
+
+                Button {
+                    commitTranscriptEdit()
+                } label: {
+                    Label("Save", systemImage: "checkmark")
+                }
+                .parakeetAction(.primaryProminent)
+                .disabled(transcriptDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            } else {
+                // Editing operates on the plain text transcript only; the Timed
+                // view is derived from word timestamps and has no editable text.
+                // Disable Edit in Timed mode rather than silently dropping the
+                // user into the raw text view when they click it.
+                Button {
+                    beginTranscriptEdit()
+                } label: {
+                    Label("Edit", systemImage: "pencil")
+                }
+                .parakeetAction(.secondary)
+                .disabled(transcriptDisplayMode != .text)
+                .help(transcriptDisplayMode == .text
+                    ? "Edit the transcript text"
+                    : "Switch to Text to edit. Edits apply to the text transcript; timestamps are preserved.")
+            }
+        }
+    }
+
+    private var transcriptEditor: some View {
+        TextEditor(text: $transcriptDraft)
+            .font(DesignSystem.Typography.bodyLarge)
+            .foregroundStyle(DesignSystem.Colors.textPrimary)
+            .lineSpacing(6)
+            .scrollContentBackground(.hidden)
+            .focused($transcriptEditorFocused)
+            .padding(DesignSystem.Spacing.md)
+            .frame(minHeight: 320)
+            .background(
+                RoundedRectangle(cornerRadius: DesignSystem.Layout.rowCornerRadius)
+                    .fill(DesignSystem.Colors.surfaceElevated.opacity(0.75))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: DesignSystem.Layout.rowCornerRadius)
+                    .strokeBorder(DesignSystem.Colors.accent.opacity(0.30), lineWidth: 1)
+            )
+    }
+
+    private var shouldShowTranscriptAISetupBanner: Bool {
+        !viewModel.llmAvailable
+            && !viewModel.hasPromptResultTabs
+            && !viewModel.hasConversations
+    }
+
+    @ViewBuilder
+    private var transcriptTextBlock: some View {
+        if findBarVisible {
+            transcriptTextBlockSearchable()
+        } else {
+            Text(transcriptText)
+                .font(scaledTranscriptFont)
+                .foregroundStyle(DesignSystem.Colors.textPrimary)
+                .textSelection(.enabled)
+                .lineSpacing(6)
+                .padding(DesignSystem.Spacing.lg)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: DesignSystem.Layout.rowCornerRadius)
+                        .fill(DesignSystem.Colors.surfaceElevated.opacity(0.6))
+                )
+        }
+    }
+
+    @ViewBuilder
+    private func transcriptTextBlockSearchable() -> some View {
+        if transcriptDisplayMode == .text {
+            transcriptFullTextSearchableBlock()
+        } else {
+            transcriptTimedTextSearchableBlocks()
+        }
+    }
+
+    private func transcriptFullTextSearchableBlock() -> some View {
+        Text(TranscriptFindHighlight.attributed(
+            transcriptText,
+            ranges: findFullTextHighlightRanges,
+            current: findFullTextCurrentHighlightRange,
+            baseFont: scaledTranscriptFont
+        ))
+        .foregroundStyle(DesignSystem.Colors.textPrimary)
+        .lineSpacing(6)
+        .textSelection(.enabled)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(alignment: .topLeading) {
+            transcriptTextFindAnchor()
+        }
+        .padding(DesignSystem.Spacing.lg)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: DesignSystem.Layout.rowCornerRadius)
+                .fill(DesignSystem.Colors.surfaceElevated.opacity(0.6))
+        )
+    }
+
+    @ViewBuilder
+    private func transcriptTextFindAnchor() -> some View {
+        if let anchor = currentTextFindAnchor {
+            Text(anchor.prefixText)
+                .font(scaledTranscriptFont)
+                .lineSpacing(6)
+                .foregroundStyle(.clear)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .overlay(alignment: .bottomLeading) {
+                    Color.clear
+                        .frame(width: 1, height: 1)
+                        .id(anchor.id)
+                }
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
+    }
+
+    private func transcriptTimedTextSearchableBlocks() -> some View {
+        let highlights = findHighlightsByBlockId
+        let current = findCurrentHighlight
+        return VStack(alignment: .leading, spacing: DesignSystem.Spacing.sm) {
+            ForEach(findBlocks) { block in
+                paragraphText(block, highlights: highlights, current: current)
+                    .foregroundStyle(DesignSystem.Colors.textPrimary)
+                    .lineSpacing(6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .id(block.id)
+            }
+        }
+        .textSelection(.enabled)
+        .padding(DesignSystem.Spacing.lg)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: DesignSystem.Layout.rowCornerRadius)
+                .fill(DesignSystem.Colors.surfaceElevated.opacity(0.6))
+        )
+    }
+
+    private func paragraphText(
+        _ block: TranscriptFindBlock,
+        highlights: [Int: [NSRange]],
+        current: (id: Int, range: NSRange)?
+    ) -> Text {
+        let ranges = highlights[block.id] ?? []
+        guard !ranges.isEmpty else {
+            return Text(block.text).font(scaledTranscriptFont)
+        }
+        let currentRange = (current?.id == block.id) ? current?.range : nil
+        return Text(TranscriptFindHighlight.attributed(
+            block.text,
+            ranges: ranges,
+            current: currentRange,
+            baseFont: scaledTranscriptFont
+        ))
+    }
+
+    private func meetingNotesSection(_ notes: String) -> some View {
+        VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
+            HStack(spacing: DesignSystem.Spacing.xs) {
+                Label("Your notes", systemImage: "note.text")
+                    .font(DesignSystem.Typography.caption.weight(.semibold))
+                    .foregroundStyle(DesignSystem.Colors.textSecondary)
+
+                Spacer()
+
+                Button {
+                    TranscriptResultActions.copyText(notes)
+                    notesCopied = true
+                    notesCopiedResetTask?.cancel()
+                    notesCopiedResetTask = Task {
+                        try? await Task.sleep(for: .seconds(1))
+                        if !Task.isCancelled {
+                            notesCopied = false
+                        }
+                    }
+                } label: {
+                    HStack(spacing: DesignSystem.Spacing.xs) {
+                        Image(systemName: notesCopied ? "checkmark" : "doc.on.doc")
+                        Text(notesCopied ? "Copied" : "Copy")
+                    }
+                    .font(DesignSystem.Typography.caption)
+                    .foregroundStyle(notesCopied ? DesignSystem.Colors.successGreen : .primary)
+                }
+                .parakeetAction(.secondary)
+                .controlSize(.small)
+                .accessibilityLabel(notesCopied ? "Notes copied" : "Copy your notes")
+            }
+
+            Text(notes)
+                .font(DesignSystem.Typography.body)
+                .foregroundStyle(DesignSystem.Colors.textPrimary)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(DesignSystem.Spacing.md)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: DesignSystem.Layout.rowCornerRadius)
+                .fill(DesignSystem.Colors.surfaceElevated.opacity(0.25))
+        )
+    }
+
+    // MARK: - Tab Bar
+
+    private var orderedTabs: [TranscriptionViewModel.TranscriptTab] {
+        var tabs: [TranscriptionViewModel.TranscriptTab] = [.transcript]
+        // Generated content after transcript, oldest first so new tabs appear on the right
+        for promptResult in promptResultsViewModel.promptResults.reversed() {
+            tabs.append(.result(id: promptResult.id))
+        }
+        for generation in promptResultsViewModel.pendingGenerations(for: transcription.id) {
+            tabs.append(.generation(id: generation.id))
+        }
+        tabs.append(.chat)
+        return tabs
+    }
+
+    private var tabBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 0) {
+                ForEach(orderedTabs, id: \.self) { tab in
+                    tabCapsule(for: tab)
+                }
+
+                generateTabButton
+
+                Spacer()
+            }
+        }
+        .mask(
+            Rectangle()
+                .padding(.vertical, -20)
+        )
+    }
+
+    private func tabCapsule(for tab: TranscriptionViewModel.TranscriptTab) -> some View {
+        let isSelected = viewModel.selectedTab == tab
+
+        let isStreamingTab = {
+            if case .generation(let id) = tab,
+               let generation = promptResultsViewModel.pendingGeneration(id: id) {
+                return generation.state == .streaming
+            }
+            return false
+        }()
+
+        let isCopiedTab: Bool = {
+            if case .result(let id) = tab { return copiedResultID == id }
+            return false
+        }()
+
+        return HStack(spacing: 6) {
+            Image(systemName: tabIcon(tab))
+                .font(.system(size: 11, weight: .semibold))
+                .symbolEffect(.pulse, options: .repeating, isActive: isStreamingTab)
+            Text(tabLabel(tab))
+                .font(DesignSystem.Typography.bodySmall.weight(isSelected ? .semibold : .regular))
+                .lineLimit(1)
+
+            if case .result(let id) = tab, promptResultsViewModel.hasUnreadPromptResult(id) {
+                Circle()
+                    .fill(DesignSystem.Colors.accent)
+                    .frame(width: 6, height: 6)
+            }
+
+            if isCopiedTab {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(DesignSystem.Colors.successGreen)
+                    .transition(.opacity)
+            }
+        }
+        .padding(.horizontal, DesignSystem.Spacing.md)
+        .padding(.vertical, 8)
+        .background(
+            Capsule()
+                .fill(isSelected ? DesignSystem.Colors.accent.opacity(0.12) : .clear)
+        )
+        .contentShape(Capsule())
+        .foregroundStyle(isSelected ? DesignSystem.Colors.accent : DesignSystem.Colors.textSecondary)
+        .animation(.easeInOut(duration: 0.3), value: isCopiedTab)
+        .onTapGesture {
+            viewModel.selectedTab = tab
+        }
+        .contextMenu {
+            if case .result(let id) = tab,
+               let promptResult = promptResultsViewModel.promptResults.first(where: { $0.id == id }) {
+                Button("Copy Result") {
+                    TranscriptResultActions.copyText(promptResult.content)
+                    copiedResultID = id
+                    resultCopiedResetTask?.cancel()
+                    resultCopiedResetTask = Task {
+                        try? await Task.sleep(for: .seconds(1.5))
+                        copiedResultID = nil
+                    }
+                }
+
+                Menu("Export Document") {
+                    Button("Markdown (.md)") { exportGenerationToDownloads(promptResult: promptResult, format: .md) }
+                    Button("Plain Text (.txt)") { exportGenerationToDownloads(promptResult: promptResult, format: .txt) }
+                }
+
+                Button("Delete Result", role: .destructive) {
+                    promptResultsViewModel.pendingDeletePromptResult = promptResult
+                }
+            }
+            if case .generation(let id) = tab {
+                Button("Remove", role: .destructive) {
+                    promptResultsViewModel.cancelGeneration(id: id)
+                }
+            }
+        }
+        .accessibilityAddTraits(.isButton)
+        .onHover { hovering in
+            if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
+    }
+
+    private var generateTabButton: some View {
+        let hasAI = promptResultsViewModel.hasPromptResultGenerationCapability
+        return Button {
+            showGeneratePopover = true
+        } label: {
+            Image(systemName: "plus")
+                .font(.system(size: 12, weight: .semibold))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .foregroundStyle(
+                    hasAI
+                        ? DesignSystem.Colors.textSecondary
+                        : DesignSystem.Colors.accent
+                )
+        }
+        .buttonStyle(.plain)
+        .contentShape(Rectangle())
+        .popover(isPresented: $showGeneratePopover) {
+            promptGenerationPopover
+                .frame(width: 420)
+                .padding(DesignSystem.Spacing.lg)
+        }
+        .accessibilityLabel(hasAI ? "New prompt generation" : "Set up AI for prompt generation")
+        .help(hasAI ? "Generate a prompt result" : "Set up AI for summaries and action items")
+        .onHover { hovering in
+            if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
+    }
+
+    private func tabIcon(_ tab: TranscriptionViewModel.TranscriptTab) -> String {
+        switch tab {
+        case .transcript:
+            return "text.alignleft"
+        case .result:
+            return "sparkles"
+        case .generation(let id):
+            switch promptResultsViewModel.pendingGeneration(id: id)?.state {
+            case .queued:
+                return "clock"
+            case .failed:
+                return "exclamationmark.triangle"
+            default:
+                return "sparkles"
+            }
+        case .chat:
+            return "bubble.left.and.text.bubble.right"
+        }
+    }
+
+    private func tabLabel(_ tab: TranscriptionViewModel.TranscriptTab) -> String {
+        switch tab {
+        case .transcript:
+            return "Transcript"
+        case .result(let id):
+            guard let promptResult = promptResultsViewModel.promptResults.first(where: { $0.id == id }) else { return "Result" }
+            return label(for: promptResult.promptName, extraInstructions: promptResult.extraInstructions)
+        case .generation(let id):
+            guard let gen = promptResultsViewModel.pendingGeneration(id: id) else { return "Result" }
+            return label(for: gen.promptName, extraInstructions: gen.extraInstructions)
+        case .chat:
+            return "Chat"
+        }
+    }
+
+    private func label(for promptName: String, extraInstructions: String?) -> String {
+        guard let extra = extraInstructions?.trimmingCharacters(in: .whitespacesAndNewlines), !extra.isEmpty else {
+            return promptName
+        }
+        let limit = 16
+        let truncated = extra.count > limit ? String(extra.prefix(limit)) + "..." : extra
+        return "\(promptName) + \"\(truncated)\""
+    }
+
+    // MARK: - Result Panes
+
+    private func promptResultContentPane(promptResultID: UUID) -> some View {
+        let promptResult = promptResultsViewModel.promptResults.first(where: { $0.id == promptResultID })
+        return ScrollView {
+            VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
+                if let promptResult {
+                    HStack {
+                        Spacer()
+
+                        Button {
+                            if let generationID = promptResultsViewModel.regeneratePromptResult(promptResult, transcript: currentAIContextText) {
+                                viewModel.selectedTab = .generation(id: generationID)
+                            }
+                        } label: {
+                            HStack(spacing: DesignSystem.Spacing.xs) {
+                                Image(systemName: "arrow.clockwise")
+                                Text("Regenerate")
+                            }
+                            .font(DesignSystem.Typography.caption)
+                        }
+                        .parakeetAction(.secondary)
+                        .controlSize(.small)
+                        .disabled(!promptResultsViewModel.canGeneratePromptResult || transcriptText.isEmpty)
+
+                        let isCopied = copiedButtonResultID == promptResultID
+                        Button {
+                            TranscriptResultActions.copyText(promptResult.content)
+                            copiedButtonResultID = promptResultID
+                            resultButtonCopiedResetTask?.cancel()
+                            resultButtonCopiedResetTask = Task {
+                                try? await Task.sleep(for: .seconds(1))
+                                copiedButtonResultID = nil
+                            }
+                        } label: {
+                            HStack(spacing: DesignSystem.Spacing.xs) {
+                                Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
+                                Text(isCopied ? "Copied" : "Copy")
+                            }
+                            .font(DesignSystem.Typography.caption)
+                            .foregroundStyle(isCopied ? DesignSystem.Colors.successGreen : .primary)
+                        }
+                        .parakeetAction(.secondary)
+                        .controlSize(.small)
+
+                        Menu {
+                            Button("Markdown (.md)") { exportGenerationToDownloads(promptResult: promptResult, format: .md) }
+                            Button("Plain Text (.txt)") { exportGenerationToDownloads(promptResult: promptResult, format: .txt) }
+                        } label: {
+                            HStack(spacing: DesignSystem.Spacing.xs) {
+                                Image(systemName: "arrow.down.doc")
+                                Text("Export")
+                            }
+                            .font(DesignSystem.Typography.caption)
+                        }
+                        .menuStyle(.borderedButton)
+                        .tint(DesignSystem.Colors.tintNeutral)
+                        .controlSize(.small)
+
+                        Button(role: .destructive) {
+                            promptResultsViewModel.pendingDeletePromptResult = promptResult
+                        } label: {
+                            HStack(spacing: DesignSystem.Spacing.xs) {
+                                Image(systemName: "trash")
+                                Text("Delete")
+                            }
+                            .font(DesignSystem.Typography.caption)
+                        }
+                        .parakeetAction(.destructive)
+                        .controlSize(.small)
+                    }
+
+                    MarkdownContentView(promptResult.content, font: DesignSystem.Typography.bodyLarge)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(DesignSystem.Spacing.lg)
+        }
+        .background(
+            RoundedRectangle(cornerRadius: DesignSystem.Layout.cardCornerRadius)
+                .fill(DesignSystem.Colors.surface)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DesignSystem.Layout.cardCornerRadius)
+                .strokeBorder(DesignSystem.Colors.border.opacity(0.75), lineWidth: 0.5)
+        )
+    }
+
+    @ViewBuilder
+    private func pendingGenerationPane(generationID: UUID) -> some View {
+        if let generation = promptResultsViewModel.pendingGeneration(id: generationID) {
+            generationPane(generation)
+        }
+    }
+
+    private func generationPane(_ generation: PromptResultsViewModel.PendingGeneration) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
+                if case .failed(let message) = generation.state {
+                    failedGenerationCard(generation, message: message)
+
+                    // Partial content streamed before the failure is still
+                    // worth reading; dimmed so it reads as incomplete.
+                    if !generation.content.isEmpty {
+                        MarkdownContentView(generation.content, font: DesignSystem.Typography.bodyLarge)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .opacity(0.6)
+                    }
+                } else {
+                    HStack {
+                        Spacer()
+                        Button {
+                            showingCancelGenerationAlert = generation.id
+                        } label: {
+                            HStack(spacing: DesignSystem.Spacing.xs) {
+                                Image(systemName: generation.state == .queued ? "minus.circle" : "xmark")
+                                Text(generation.state == .queued ? "Remove" : "Cancel")
+                            }
+                            .font(DesignSystem.Typography.caption)
+                        }
+                        .parakeetAction(.secondary)
+                        .controlSize(.small)
+                    }
+
+                    if generation.state == .queued {
+                        queuedGenerationCard
+                    } else if generation.content.isEmpty {
+                        SummarySkeletonView()
+                    } else {
+                        MarkdownContentView(generation.content, font: DesignSystem.Typography.bodyLarge)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(DesignSystem.Spacing.lg)
+        }
+        .background(
+            RoundedRectangle(cornerRadius: DesignSystem.Layout.cardCornerRadius)
+                .fill(DesignSystem.Colors.surface)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DesignSystem.Layout.cardCornerRadius)
+                .strokeBorder(DesignSystem.Colors.border.opacity(0.75), lineWidth: 0.5)
+        )
+        .alert(
+            generation.state == .queued ? "Remove from queue?" : "Cancel generation?",
+            isPresented: Binding(
+                get: { showingCancelGenerationAlert == generation.id },
+                set: { if !$0 { showingCancelGenerationAlert = nil } }
+            )
+        ) {
+            Button("Keep", role: .cancel) { }
+            Button(generation.state == .queued ? "Remove" : "Cancel", role: .destructive) {
+                promptResultsViewModel.cancelGeneration(id: generation.id)
+                viewModel.selectedTab = .transcript
+            }
+        } message: {
+            Text(generation.state == .queued
+                 ? "This will remove the prompt from the generation queue."
+                 : "This will stop the AI from generating the result.")
+        }
+    }
+
+    private func failedGenerationCard(
+        _ generation: PromptResultsViewModel.PendingGeneration,
+        message: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: DesignSystem.Spacing.sm) {
+            Label("Generation failed", systemImage: "exclamationmark.triangle.fill")
+                .font(DesignSystem.Typography.caption.weight(.semibold))
+                .foregroundStyle(DesignSystem.Colors.errorRed)
+
+            Text(message)
+                .font(DesignSystem.Typography.body)
+                .foregroundStyle(DesignSystem.Colors.textSecondary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            HStack(spacing: DesignSystem.Spacing.sm) {
+                Button {
+                    if let newID = promptResultsViewModel.retryGeneration(id: generation.id) {
+                        viewModel.selectedTab = .generation(id: newID)
+                    }
+                } label: {
+                    Label("Retry", systemImage: "arrow.clockwise")
+                }
+                .parakeetAction(.primary)
+                .controlSize(.regular)
+
+                Button("Dismiss") {
+                    let replacingID = generation.replacingPromptResultID
+                    promptResultsViewModel.cancelGeneration(id: generation.id)
+                    viewModel.selectedTab = replacingID.map { .result(id: $0) } ?? .transcript
+                }
+                .parakeetAction(.secondary)
+                .controlSize(.regular)
+            }
+            .padding(.top, DesignSystem.Spacing.xs)
+        }
+        .padding(DesignSystem.Spacing.lg)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: DesignSystem.Layout.rowCornerRadius)
+                .fill(DesignSystem.Colors.surfaceElevated.opacity(0.7))
+        )
+    }
+
+    private var queuedGenerationCard: some View {
+        VStack(alignment: .leading, spacing: DesignSystem.Spacing.sm) {
+            Label("Queued", systemImage: "clock")
+                .font(DesignSystem.Typography.caption.weight(.semibold))
+                .foregroundStyle(DesignSystem.Colors.accent)
+            Text("This result will start automatically after the current generation finishes.")
+                .font(DesignSystem.Typography.body)
+                .foregroundStyle(DesignSystem.Colors.textSecondary)
+        }
+        .padding(DesignSystem.Spacing.lg)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: DesignSystem.Layout.rowCornerRadius)
+                .fill(DesignSystem.Colors.surfaceElevated.opacity(0.7))
+        )
+    }
+
+    @ViewBuilder
+    private var promptGenerationPopover: some View {
+        if promptResultsViewModel.hasPromptResultGenerationCapability {
+            promptGenerationControls
+        } else {
+            promptGenerationSetupPopover
+        }
+    }
+
+    private var promptGenerationControls: some View {
+        VStack(alignment: .leading, spacing: DesignSystem.Spacing.lg) {
+            // Prompt chips
+            promptChips
+
+            // Model selector
+            if !promptResultsViewModel.availableModels.isEmpty {
+                ModelSelectorView(
+                    currentModel: promptResultsViewModel.currentModelName,
+                    displayName: promptResultsViewModel.modelDisplayName,
+                    availableModels: promptResultsViewModel.availableModels,
+                    disabled: promptResultsViewModel.hasActiveGenerations,
+                    onSelect: { promptResultsViewModel.selectModel($0) }
+                )
+            }
+
+            // Extra instructions
+            TextField("Extra instructions (optional)", text: $promptResultsViewModel.extraInstructions)
+                .textFieldStyle(.roundedBorder)
+                .font(DesignSystem.Typography.body)
+
+            if promptResultsViewModel.hasActiveGenerations {
+                Text(queueStatusText)
+                    .font(DesignSystem.Typography.caption)
+                    .foregroundStyle(DesignSystem.Colors.textSecondary)
+            }
+
+            if let errorMessage = promptResultsViewModel.errorMessage {
+                Text(errorMessage)
+                    .font(DesignSystem.Typography.caption)
+                    .foregroundStyle(DesignSystem.Colors.errorRed)
+            }
+
+            // Actions row — manage prompts on the left, generate on the right
+            HStack {
+                Button {
+                    showGeneratePopover = false
+                    showPromptLibrary = true
+                } label: {
+                    Label("Manage Prompts", systemImage: "slider.horizontal.3")
+                }
+                .parakeetAction(.secondary)
+                .controlSize(.regular)
+
+                Spacer()
+
+                Button {
+                    showGeneratePopover = false
+                    if let generationID = promptResultsViewModel.generatePromptResult(
+                        transcript: currentAIContextText,
+                        transcriptionId: transcription.id
+                    ) {
+                        viewModel.selectedTab = .generation(id: generationID)
+                    }
+                } label: {
+                    Label("Generate", systemImage: "sparkles")
+                }
+                .parakeetAction(.primaryProminent)
+                .controlSize(.regular)
+                .keyboardShortcut(.return, modifiers: .command)
+                .disabled(!promptResultsViewModel.canGenerateManualPromptResult || transcriptText.isEmpty)
+            }
+        }
+    }
+
+    private var promptGenerationSetupPopover: some View {
+        VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
+            HStack(alignment: .top, spacing: DesignSystem.Spacing.sm) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(DesignSystem.Colors.accent)
+                    .frame(width: 20, height: 20)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Turn on AI for summaries and action items")
+                        .font(DesignSystem.Typography.body.weight(.semibold))
+                        .foregroundStyle(DesignSystem.Colors.textPrimary)
+
+                    Text("MacParakeet can generate summaries, action items, and custom prompt results from this transcript. Transcription still works without AI.")
+                        .font(DesignSystem.Typography.bodySmall)
+                        .foregroundStyle(DesignSystem.Colors.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            HStack {
+                Spacer()
+
+                Button {
+                    showGeneratePopover = false
+                    onSetUpAI?()
+                } label: {
+                    Label("Set up AI", systemImage: "gearshape")
+                }
+                .parakeetAction(.primaryProminent)
+                .controlSize(.regular)
+            }
+        }
+    }
+
+    private var promptChips: some View {
+        let prompts = promptResultsViewModel.visiblePrompts
+        return FlowLayout(spacing: 8) {
+            ForEach(prompts) { prompt in
+                let isSelected = promptResultsViewModel.selectedPrompt?.id == prompt.id
+                let hasExisting = promptResultsViewModel.promptResults.contains { $0.promptName == prompt.name }
+                    || promptResultsViewModel.hasPendingGeneration(
+                        promptName: prompt.name,
+                        transcriptionId: transcription.id
+                    )
+
+                HStack(spacing: 5) {
+                    Text(prompt.name)
+                        .font(DesignSystem.Typography.body.weight(isSelected ? .semibold : .regular))
+                        .lineLimit(1)
+                    if hasExisting {
+                        Circle()
+                            .fill(DesignSystem.Colors.accent)
+                            .frame(width: 6, height: 6)
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(
+                    Capsule()
+                        .fill(isSelected ? DesignSystem.Colors.accent.opacity(0.15) : DesignSystem.Colors.surfaceElevated)
+                )
+                .overlay(
+                    Capsule()
+                        .strokeBorder(isSelected ? DesignSystem.Colors.accent.opacity(0.4) : DesignSystem.Colors.border.opacity(0.5), lineWidth: 0.5)
+                )
+                .foregroundStyle(isSelected ? DesignSystem.Colors.accent : DesignSystem.Colors.textPrimary)
+                .contentShape(Capsule())
+                .onTapGesture {
+                    withAnimation(DesignSystem.Animation.selectionChange) {
+                        promptResultsViewModel.selectedPrompt = prompt
+                    }
+                }
+                .onHover { hovering in
+                    if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                }
+            }
+        }
+    }
+
+    private var queueStatusText: String {
+        if promptResultsViewModel.isStreaming && promptResultsViewModel.queuedGenerationCount > 0 {
+            return "1 generating, \(promptResultsViewModel.queuedGenerationCount) queued"
+        }
+        if promptResultsViewModel.isStreaming {
+            return "Generating result"
+        }
+        return "\(promptResultsViewModel.queuedGenerationCount) queued"
+    }
+
+    // MARK: - Chat Pane
+
+    @ViewBuilder
+    private func chatPane(viewModel chatVM: TranscriptChatViewModel) -> some View {
+        VStack(spacing: 0) {
+            // Chat header with conversation switcher
+            if !chatVM.conversations.isEmpty || !chatVM.messages.isEmpty {
+                chatPaneHeader(chatVM: chatVM)
+                Divider()
+            }
+
+            ScrollViewReader { proxy in
+                VStack(spacing: 0) {
+                    if chatVM.canSendMessage && chatVM.messages.isEmpty {
+                        VStack(spacing: DesignSystem.Spacing.md) {
+                            chatEmptyState(chatVM: chatVM)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                            if let error = chatVM.errorMessage {
+                                chatErrorRow(error)
+                            }
+                        }
+                        .padding(DesignSystem.Spacing.lg)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(DesignSystem.Colors.surface)
+                    } else {
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: DesignSystem.Spacing.lg) {
+                                if !chatVM.canSendMessage {
+                                    chatConfigurationBanner
+                                }
+
+                                ForEach(chatVM.messages) { message in
+                                    chatBubble(message)
+                                        .id(message.id)
+                                }
+
+                                if let error = chatVM.errorMessage {
+                                    chatErrorRow(error)
+                                }
+                            }
+                            .padding(DesignSystem.Spacing.lg)
+                        }
+                        .defaultScrollAnchor(.bottom)
+                        .background(DesignSystem.Colors.surface)
+                    }
+
+                    Divider()
+
+                    VStack(alignment: .leading, spacing: DesignSystem.Spacing.sm) {
+                        HStack(spacing: DesignSystem.Spacing.sm) {
+                            TextField("Ask about this transcript...", text: Bindable(chatVM).inputText)
+                                .textFieldStyle(.plain)
+                                .font(DesignSystem.Typography.bodyLarge)
+                                .padding(.horizontal, DesignSystem.Spacing.md)
+                                .padding(.vertical, 12)
+                                .focused($chatInputFocused)
+                                .onSubmit {
+                                    if !chatVM.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chatVM.canSendMessage && !chatVM.isStreaming {
+                                        chatVM.sendMessage()
+                                    }
+                                    chatInputFocused = true
+                                }
+                                .disabled(chatVM.isStreaming || !chatVM.canSendMessage)
+                                .onAppear {
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                        chatInputFocused = true
+                                    }
+                                }
+                                .onChange(of: chatVM.isStreaming) { _, isStreaming in
+                                    if !isStreaming { chatInputFocused = true }
+                                }
+                                .background(
+                                    RoundedRectangle(cornerRadius: 14)
+                                        .fill(DesignSystem.Colors.surfaceElevated)
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 14)
+                                        .strokeBorder(DesignSystem.Colors.border.opacity(0.5), lineWidth: 1)
+                                )
+
+                            if chatVM.isStreaming {
+                                Button {
+                                    chatVM.cancelStreaming()
+                                } label: {
+                                    Image(systemName: "stop.circle.fill")
+                                        .font(.system(size: 26))
+                                }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(DesignSystem.Colors.errorRed)
+                                .contentShape(Circle())
+                            } else {
+                                let canSend = !chatVM.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chatVM.canSendMessage
+                                Button {
+                                    chatVM.sendMessage()
+                                    chatInputFocused = true
+                                } label: {
+                                    Image(systemName: "arrow.up.circle.fill")
+                                        .font(.system(size: 26))
+                                }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(canSend ? DesignSystem.Colors.accent : DesignSystem.Colors.accent.opacity(0.3))
+                                .disabled(!canSend)
+                                .contentShape(Circle())
+                            }
+                        }
+
+                        HStack(spacing: DesignSystem.Spacing.sm) {
+                            if chatVM.canSendMessage && !chatVM.availableModels.isEmpty {
+                                ModelSelectorView(
+                                    currentModel: chatVM.currentModelName,
+                                    displayName: chatVM.modelDisplayName,
+                                    availableModels: chatVM.availableModels,
+                                    disabled: chatVM.isStreaming,
+                                    onSelect: { chatVM.selectModel($0) }
+                                )
+                            }
+
+                            if chatVM.isStreaming {
+                                Text("Streaming response…")
+                                    .font(DesignSystem.Typography.caption)
+                                    .foregroundStyle(DesignSystem.Colors.textSecondary)
+                            }
+
+                            Spacer()
+                        }
+                    }
+                    .padding(DesignSystem.Spacing.md)
+                    .background(DesignSystem.Colors.cardBackground)
+                }
+                .onChange(of: chatVM.messages.count) {
+                    if let lastID = chatVM.messages.last?.id {
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                            proxy.scrollTo(lastID, anchor: .bottom)
+                        }
+                    }
+                }
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: DesignSystem.Layout.cardCornerRadius)
+                .fill(DesignSystem.Colors.surface)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DesignSystem.Layout.cardCornerRadius)
+                .strokeBorder(DesignSystem.Colors.border.opacity(0.75), lineWidth: 0.5)
+        )
+    }
+
+    @ViewBuilder
+    private func chatPaneHeader(chatVM: TranscriptChatViewModel) -> some View {
+        HStack(spacing: DesignSystem.Spacing.sm) {
+            Button {
+                showConversationPopover.toggle()
+            } label: {
+                HStack(spacing: 4) {
+                    Text(chatVM.currentConversation?.title ?? "New Chat")
+                        .font(DesignSystem.Typography.caption)
+                        .foregroundStyle(DesignSystem.Colors.textPrimary)
+                        .lineLimit(1)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(DesignSystem.Colors.textSecondary)
+                }
+            }
+            .buttonStyle(.plain)
+            .popover(isPresented: $showConversationPopover, arrowEdge: .bottom) {
+                conversationListPopover(chatVM: chatVM)
+            }
+
+            Spacer()
+
+            Button {
+                chatVM.newChat()
+            } label: {
+                Label("New Chat", systemImage: "plus.bubble")
+                    .font(DesignSystem.Typography.caption)
+            }
+            .parakeetAction(.secondary)
+            .controlSize(.small)
+        }
+        .padding(.horizontal, DesignSystem.Spacing.md)
+        .padding(.vertical, DesignSystem.Spacing.sm)
+        .background(DesignSystem.Colors.cardBackground)
+    }
+
+    @ViewBuilder
+    private func conversationListPopover(chatVM: TranscriptChatViewModel) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(chatVM.conversations) { conversation in
+                HStack(spacing: DesignSystem.Spacing.sm) {
+                    Text(conversation.title.isEmpty ? "Untitled" : conversation.title)
+                        .font(DesignSystem.Typography.caption)
+                        .foregroundStyle(DesignSystem.Colors.textPrimary)
+                        .lineLimit(1)
+
+                    Spacer()
+
+                    if hoveredConversationId == conversation.id {
+                        Button {
+                            chatVM.deleteConversation(conversation)
+                            if chatVM.conversations.isEmpty {
+                                showConversationPopover = false
+                            }
+                        } label: {
+                            Image(systemName: "trash")
+                                .font(.system(size: 11))
+                                .foregroundStyle(DesignSystem.Colors.textSecondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, DesignSystem.Spacing.md)
+                .padding(.vertical, DesignSystem.Spacing.sm)
+                .background(
+                    chatVM.currentConversation?.id == conversation.id
+                        ? DesignSystem.Colors.accent.opacity(0.1)
+                        : Color.clear
+                )
+                .contentShape(Rectangle())
+                .onHover { isHovered in
+                    if isHovered {
+                        hoveredConversationId = conversation.id
+                    } else if hoveredConversationId == conversation.id {
+                        hoveredConversationId = nil
+                    }
+                }
+                .onTapGesture {
+                    chatVM.switchConversation(conversation)
+                    showConversationPopover = false
+                }
+            }
+        }
+        .frame(minWidth: 200, maxWidth: 300)
+        .padding(.vertical, DesignSystem.Spacing.sm)
+    }
+
+    @ViewBuilder
+    private func chatBubble(_ message: ChatDisplayMessage) -> some View {
+        let isUser = message.role == .user
+
+        HStack(alignment: .bottom, spacing: DesignSystem.Spacing.sm) {
+            if isUser { Spacer(minLength: 80) }
+
+            if !isUser {
+                ZStack {
+                    Circle()
+                        .fill(DesignSystem.Colors.surfaceElevated)
+                        .frame(width: 26, height: 26)
+                        .shadow(color: .black.opacity(0.06), radius: 2, y: 1)
+
+                    if message.isStreaming {
+                        SpinnerRingView(size: 14, revolutionDuration: 2.0, tintColor: DesignSystem.Colors.accent)
+                    } else {
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(DesignSystem.Colors.accent)
+                    }
+                }
+            }
+
+            VStack(alignment: isUser ? .trailing : .leading, spacing: 4) {
+                if message.content.isEmpty && message.isStreaming {
+                    ChatLoadingSweep()
+                } else {
+                    let bubbleShape = UnevenRoundedRectangle(
+                        topLeadingRadius: DesignSystem.Layout.cornerRadius,
+                        bottomLeadingRadius: isUser ? DesignSystem.Layout.cornerRadius : 4,
+                        bottomTrailingRadius: isUser ? 4 : DesignSystem.Layout.cornerRadius,
+                        topTrailingRadius: DesignSystem.Layout.cornerRadius
+                    )
+
+                    VStack(alignment: .leading, spacing: 0) {
+                        if isUser {
+                            Text(message.content)
+                                .font(DesignSystem.Typography.body)
+                                .foregroundStyle(DesignSystem.Colors.onAccent)
+                                .textSelection(.enabled)
+                        } else {
+                            MarkdownContentView(message.content)
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .frame(maxWidth: isUser ? nil : 620, alignment: .leading)
+                    .background(
+                        bubbleShape.fill(isUser
+                            ? DesignSystem.Colors.accent
+                            : DesignSystem.Colors.surfaceElevated)
+                    )
+                    .overlay(
+                        bubbleShape.strokeBorder(
+                            isUser
+                                ? Color.white.opacity(0.12)
+                                : DesignSystem.Colors.border.opacity(0.4),
+                            lineWidth: 0.5
+                        )
+                    )
+                    .shadow(color: .black.opacity(isUser ? 0.12 : 0.05), radius: isUser ? 3 : 2, y: 1)
+                    .overlay(alignment: .bottomTrailing) {
+                        if !isUser && !message.isStreaming && !message.content.isEmpty {
+                            if hoveredMessageId == message.id || copiedMessageId == message.id {
+                                Button {
+                                    TranscriptResultActions.copyText(message.content)
+                                    copiedMessageId = message.id
+                                    copiedResetTask?.cancel()
+                                    copiedResetTask = Task {
+                                        try? await Task.sleep(for: .seconds(2))
+                                        copiedMessageId = nil
+                                    }
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: copiedMessageId == message.id ? "checkmark" : "doc.on.doc")
+                                            .font(.system(size: 10))
+                                        if copiedMessageId == message.id {
+                                            Text("Copied")
+                                                .font(DesignSystem.Typography.micro)
+                                        }
+                                    }
+                                    .foregroundStyle(copiedMessageId == message.id ? DesignSystem.Colors.successGreen : DesignSystem.Colors.textTertiary)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 3)
+                                    .background(
+                                        Capsule()
+                                            .fill(DesignSystem.Colors.surfaceElevated.opacity(0.85))
+                                            .overlay(Capsule().strokeBorder(DesignSystem.Colors.border.opacity(0.3), lineWidth: 0.5))
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                                .transition(.opacity)
+                                .padding(4)
+                            }
+                        }
+                    }
+                    .onHover { hovering in
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            hoveredMessageId = hovering ? message.id : nil
+                        }
+                    }
+                }
+            }
+
+            if !isUser { Spacer(minLength: 80) }
+        }
+    }
+
+    private var chatConfigurationBanner: some View {
+        HStack(alignment: .top, spacing: DesignSystem.Spacing.sm) {
+            Image(systemName: "brain")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(DesignSystem.Colors.accent)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Turn on AI for summaries and chat")
+                    .font(DesignSystem.Typography.body.weight(.semibold))
+                    .foregroundStyle(DesignSystem.Colors.textPrimary)
+                Text("MacParakeet can use a local AI app, your API key, or a command-line AI tool. Transcription still works without this.")
+                    .font(DesignSystem.Typography.bodySmall)
+                    .foregroundStyle(DesignSystem.Colors.textSecondary)
+            }
+
+            Spacer()
+
+            Button {
+                onSetUpAI?()
+            } label: {
+                Label("Set up AI", systemImage: "gearshape")
+            }
+            .parakeetAction(.secondary)
+            .controlSize(.small)
+        }
+        .padding(DesignSystem.Spacing.md)
+        .background(
+            RoundedRectangle(cornerRadius: DesignSystem.Layout.rowCornerRadius)
+                .fill(DesignSystem.Colors.accentLight)
+        )
+    }
+
+    /// Shown above a meeting transcript that has text but no word timestamps
+    /// (for example, it was transcribed with Cohere). Makes the
+    /// text-only trade-off visible without promising speaker-label quality.
+    private var meetingNoWordTimestampsBannerPresentation: MeetingTimedTranscriptRecoveryBannerPresentation? {
+        let hasRetainedAudio =
+            onRetranscribe != nil
+            && (activeTranscription.filePath.map { FileManager.default.fileExists(atPath: $0) } ?? false)
+        // Resolve the rerun choice from the live transcription so the banner
+        // stays in sync with what's actually shown.
+        let timestampCapableRerun: SpeechEngineSelection? = hasRetainedAudio
+            ? viewModel.retranscriptionEngineOption(for: activeTranscription)?
+                .firstTimestampCapableChoice?.selection
+            : nil
+        return MeetingTimedTranscriptRecoveryBannerPresentation.make(
+            transcriptText: transcriptText,
+            hasRetainedAudio: hasRetainedAudio,
+            timestampCapableRerun: timestampCapableRerun
+        )
+    }
+
+    private func meetingNoWordTimestampsBanner(
+        _ presentation: MeetingTimedTranscriptRecoveryBannerPresentation
+    ) -> some View {
+        return HStack(alignment: .top, spacing: DesignSystem.Spacing.sm) {
+            Image(systemName: "clock")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(DesignSystem.Colors.accent)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(presentation.title)
+                    .font(DesignSystem.Typography.body.weight(.semibold))
+                    .foregroundStyle(DesignSystem.Colors.textPrimary)
+                Text(presentation.message)
+                    .font(DesignSystem.Typography.bodySmall)
+                    .foregroundStyle(DesignSystem.Colors.textSecondary)
+            }
+
+            Spacer()
+
+            if let action = presentation.action {
+                Button {
+                    retranscriptionConfirmation = RetranscriptionConfirmation(
+                        transcriptionID: activeTranscription.id,
+                        speechEngineOverride: action.selection
+                    )
+                } label: {
+                    Label(
+                        action.title,
+                        systemImage: "arrow.trianglehead.2.clockwise"
+                    )
+                }
+                .parakeetAction(.secondary)
+                .controlSize(.small)
+            }
+        }
+        .padding(DesignSystem.Spacing.md)
+        .background(
+            RoundedRectangle(cornerRadius: DesignSystem.Layout.rowCornerRadius)
+                .fill(DesignSystem.Colors.accentLight)
+        )
+    }
+
+    @ViewBuilder
+    private func chatErrorRow(_ error: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(DesignSystem.Colors.errorRed)
+            Text(error)
+                .font(DesignSystem.Typography.caption)
+                .foregroundStyle(DesignSystem.Colors.errorRed)
+        }
+        .padding(.horizontal, DesignSystem.Spacing.md)
+    }
+
+    private func chatEmptyState(chatVM: TranscriptChatViewModel) -> some View {
+        VStack(spacing: 0) {
+            Spacer(minLength: DesignSystem.Spacing.hero)
+
+            VStack(spacing: DesignSystem.Spacing.lg) {
+                MeditativeMerkabaView(
+                    size: 60,
+                    revolutionDuration: 6.0,
+                    tintColor: DesignSystem.Colors.accent
+                )
+
+                VStack(spacing: DesignSystem.Spacing.xs) {
+                    Text("Ask a question about this transcript")
+                        .foregroundStyle(DesignSystem.Colors.textPrimary)
+                        .font(DesignSystem.Typography.pageTitle)
+
+                    Text("Start with a quick prompt, then keep drilling down.")
+                        .foregroundStyle(DesignSystem.Colors.textSecondary)
+                        .font(DesignSystem.Typography.body)
+                }
+
+                HStack(spacing: DesignSystem.Spacing.sm) {
+                    ForEach(suggestedPrompts, id: \.self) { prompt in
+                        Button {
+                            chatVM.inputText = prompt
+                            chatVM.sendMessage()
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "sparkles")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(DesignSystem.Colors.accent.opacity(0.7))
+                                Text(prompt)
+                                    .font(DesignSystem.Typography.bodySmall)
+                            }
+                            .padding(.horizontal, DesignSystem.Spacing.md)
+                            .padding(.vertical, 8)
+                            .background(
+                                Capsule()
+                                    .fill(DesignSystem.Colors.surfaceElevated)
+                                    .overlay(
+                                        Capsule()
+                                            .stroke(DesignSystem.Colors.border.opacity(0.8), lineWidth: 1)
+                                    )
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(DesignSystem.Colors.textPrimary)
+                    }
+                }
+            }
+
+            Spacer(minLength: DesignSystem.Spacing.hero)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.horizontal, DesignSystem.Spacing.lg)
+        .background(
+            RoundedRectangle(cornerRadius: DesignSystem.Layout.rowCornerRadius)
+                .fill(DesignSystem.Colors.surfaceElevated.opacity(0.55))
+        )
+    }
+
+    // MARK: - Mandala Data
+
+    private var mandalaData: MandalaData {
+        if let timestamps = activeTranscription.wordTimestamps, !timestamps.isEmpty {
+            return .from(wordTimestamps: timestamps)
+        }
+        return .from(
+            text: activeTranscription.cleanTranscript ?? activeTranscription.rawTranscript ?? activeTranscription.fileName,
+            durationMs: activeTranscription.durationMs ?? 1000
+        )
+    }
+
+    // MARK: - Timestamped View
+
+    @ViewBuilder
+    private func timestampedView(words _: [WordTimestamp]) -> some View {
+        // Compute the highlight map once here, not per row, so a long transcript
+        // with an active find doesn't rescan matches for every segment.
+        let highlights = findHighlightsByBlockId
+        let current = findCurrentHighlight
+        TranscriptTimestampedContentView(
+            hasSpeakers: cachedHasSpeakers,
+            identifiedTurns: cachedIdentifiedTurns,
+            segments: cachedSegments,
+            speakerColorMap: cachedSpeakerColorMap,
+            speakerLabelForID: { cachedSpeakerLabelMap[$0] ?? "Unknown" },
+            speakerLabelContent: { speakerID, speakerLabel, speakerColor, renameContextID, isRenameButtonVisuallyRevealed in
+                speakerLabelView(
+                    speaker: SpeakerInfo(id: speakerID, label: speakerLabel),
+                    color: speakerColor,
+                    contextID: renameContextID,
+                    font: DesignSystem.Typography.body.weight(.semibold),
+                    renameButtonOpacity: SpeakerRenameAccessibility.renameButtonOpacity(
+                        isVisuallyRevealed: isRenameButtonVisuallyRevealed
+                    )
+                )
+            },
+            isSegmentActive: isSegmentActiveBinarySearch(segmentIndex:),
+            timestampLabel: { formatTimestamp(ms: $0) },
+            isTimestampSeekable: playerViewModel.playerState == .ready,
+            onTimestampTap: { startMs in
+                playerViewModel.seek(toMs: startMs)
+                if !playerViewModel.isPlaying {
+                    playerViewModel.togglePlayPause()
+                }
+                autoScrollPaused = false
+                scrollPauseTask?.cancel()
+            },
+            bodyFont: scaledTranscriptFont,
+            highlightRangesByStartMs: highlights,
+            currentHighlight: current
+        )
+    }
+
+    // MARK: - Speaker Summary Panel
+
+    @ViewBuilder
+    private func speakerSummaryPanel(speakers: [SpeakerInfo]) -> some View {
+        let colorMap = buildSpeakerColorMap()
+        let speakerStats = TranscriptSegmenter.computeSpeakerStats(
+            diarizationSegments: activeTranscription.diarizationSegments,
+            wordTimestamps: activeTranscription.wordTimestamps
+        )
+
+        VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    speakerOverviewExpanded.toggle()
+                }
+            } label: {
+                HStack {
+                    Text("Speaker overview")
+                        .font(DesignSystem.Typography.body.weight(.semibold))
+                        .foregroundStyle(DesignSystem.Colors.textPrimary)
+
+                    if !speakerOverviewExpanded {
+                        // Compact inline speaker dots when collapsed
+                        HStack(spacing: 4) {
+                            ForEach(speakers.prefix(6), id: \.id) { speaker in
+                                Circle()
+                                    .fill(colorMap[speaker.id] ?? DesignSystem.Colors.textTertiary)
+                                    .frame(width: 8, height: 8)
+                            }
+                        }
+                    }
+
+                    Spacer()
+
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(DesignSystem.Colors.textTertiary)
+                        .rotationEffect(.degrees(speakerOverviewExpanded ? 180 : 0))
+                }
+            }
+            .buttonStyle(.plain)
+            .contentShape(Rectangle())
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(SpeakerRenameAccessibility.overviewToggleLabel(isExpanded: speakerOverviewExpanded))
+            .accessibilityHint(SpeakerRenameAccessibility.overviewToggleHint)
+            .accessibilityIdentifier(SpeakerRenameAccessibility.overviewToggleIdentifier)
+
+            if speakerOverviewExpanded {
+                ForEach(speakers, id: \.id) { speaker in
+                    let stats = speakerStats[speaker.id]
+                    HStack(spacing: DesignSystem.Spacing.md) {
+                        Circle()
+                            .fill(colorMap[speaker.id] ?? DesignSystem.Colors.textTertiary)
+                            .frame(width: 10, height: 10)
+
+                        VStack(alignment: .leading, spacing: 6) {
+                            speakerLabelView(
+                                speaker: speaker,
+                                color: colorMap[speaker.id] ?? DesignSystem.Colors.textSecondary,
+                                contextID: SpeakerRenameAccessibility.overviewRenameContextIdentifier(for: speaker.id)
+                            )
+
+                            if let stats {
+                                HStack(spacing: DesignSystem.Spacing.sm) {
+                                    metadataChip(icon: "clock", text: formatSpeakingTime(ms: stats.speakingTimeMs), tint: DesignSystem.Colors.textSecondary)
+                                    metadataChip(icon: "text.word.spacing", text: "\(stats.wordCount.formatted()) words", tint: DesignSystem.Colors.textSecondary)
+                                }
+                            }
+                        }
+
+                        Spacer()
+                    }
+                    .padding(DesignSystem.Spacing.md)
+                    .background(
+                        RoundedRectangle(cornerRadius: DesignSystem.Layout.rowCornerRadius)
+                            .fill(DesignSystem.Colors.surfaceElevated.opacity(0.45))
+                    )
+                }
+                Text("Speaker labels are approximate.")
+                    .font(DesignSystem.Typography.caption)
+                    .foregroundStyle(DesignSystem.Colors.textTertiary)
+            }
+        }
+        .padding(DesignSystem.Spacing.md)
+        .background(
+            RoundedRectangle(cornerRadius: DesignSystem.Layout.rowCornerRadius)
+                .fill(DesignSystem.Colors.surfaceElevated.opacity(0.25))
+        )
+    }
+
+    @ViewBuilder
+    private func speakerLabelView(
+        speaker: SpeakerInfo,
+        color: Color,
+        contextID: String,
+        font: Font = DesignSystem.Typography.caption.weight(.semibold),
+        renameButtonOpacity: Double = SpeakerRenameAccessibility.renameButtonOpacity(isVisuallyRevealed: true)
+    ) -> some View {
+        if editingSpeakerId == speaker.id, editingSpeakerContextID == contextID {
+            TextField("Name", text: $editingSpeakerLabel)
+                .font(font)
+                .foregroundStyle(color)
+                .textFieldStyle(.plain)
+                .frame(minWidth: 60, maxWidth: 200)
+                .focused($speakerRenameFocused)
+                .task { speakerRenameFocused = true }
+                .onSubmit {
+                    commitSpeakerRename()
+                }
+                .onExitCommand {
+                    cancelSpeakerRename()
+                }
+                .onChange(of: speakerRenameFocused) {
+                    if !speakerRenameFocused {
+                        commitSpeakerRename()
+                    }
+                }
+                .accessibilityLabel(SpeakerRenameAccessibility.speakerNameFieldLabel)
+                .accessibilityHint(SpeakerRenameAccessibility.speakerNameFieldHint)
+                .accessibilityIdentifier(SpeakerRenameAccessibility.speakerNameFieldIdentifier(contextID: contextID))
+        } else {
+            HStack(spacing: 6) {
+                Text(speaker.label)
+                    .font(font)
+                    .foregroundStyle(color)
+                    .onTapGesture {
+                        beginSpeakerRename(speaker, contextID: contextID)
+                    }
+
+                Button {
+                    beginSpeakerRename(speaker, contextID: contextID)
+                } label: {
+                    Label(SpeakerRenameAccessibility.renameButtonLabel(for: speaker.label), systemImage: "pencil")
+                        .labelStyle(.iconOnly)
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(width: 20, height: 20)
+                }
+                .parakeetAction(.subtle)
+                .controlSize(.small)
+                .help(SpeakerRenameAccessibility.renameButtonLabel(for: speaker.label))
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(SpeakerRenameAccessibility.renameButtonLabel(for: speaker.label))
+                .accessibilityHint(SpeakerRenameAccessibility.renameButtonHint)
+                .accessibilityIdentifier(SpeakerRenameAccessibility.renameButtonIdentifier(contextID: contextID))
+                .opacity(renameButtonOpacity)
+            }
+            .accessibilityElement(children: .contain)
+        }
+    }
+
+    private func beginSpeakerRename(_ speaker: SpeakerInfo, contextID: String) {
+        if editingSpeakerId != nil, editingSpeakerId != speaker.id || editingSpeakerContextID != contextID {
+            commitSpeakerRename()
+        }
+        editingSpeakerId = speaker.id
+        editingSpeakerContextID = contextID
+        editingSpeakerLabel = speaker.label
+    }
+
+    private func commitSpeakerRename() {
+        guard let speakerId = editingSpeakerId else { return }
+        let trimmed = editingSpeakerLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            viewModel.renameSpeaker(id: speakerId, to: trimmed)
+            rebuildSegmentCache()
+        }
+        cancelSpeakerRename()
+    }
+
+    private func cancelSpeakerRename() {
+        editingSpeakerId = nil
+        editingSpeakerContextID = nil
+        editingSpeakerLabel = ""
+        speakerRenameFocused = false
+    }
+
+
+    private func formatSpeakingTime(ms: Int) -> String {
+        let totalSeconds = ms / 1000
+        let minutes = totalSeconds / 60
+        let seconds = totalSeconds % 60
+        if minutes > 0 {
+            return "\(minutes)m \(seconds)s"
+        }
+        return "\(seconds)s"
+    }
+
+    // MARK: - Segment Cache
+
+    /// Rebuild cached segment data. Called once on appear and when transcription.id changes.
+    private func rebuildSegmentCache() {
+        guard let words = activeTranscription.wordTimestamps, !words.isEmpty else {
+            cachedSegments = []
+            cachedTurns = []
+            cachedIdentifiedTurns = []
+            cachedHasSpeakers = false
+            cachedSpeakerColorMap = [:]
+            cachedSpeakerLabelMap = [:]
+            cachedSegmentStartMs = []
+            return
+        }
+
+        let sourceScoped = words.contains { $0.speakerId?.contains(":") == true }
+        let segments = sourceScoped
+            ? TranscriptSegmenter.groupParallelSpeakersIntoSegments(words: words)
+            : TranscriptSegmenter.groupIntoSegments(words: words)
+        let hasSpeakers = words.contains { $0.speakerId != nil }
+
+        cachedSegments = segments
+        cachedHasSpeakers = hasSpeakers
+        cachedSpeakerColorMap = buildSpeakerColorMap()
+        cachedSpeakerLabelMap = buildSpeakerLabelMap()
+        cachedSegmentStartMs = segments.map(\.startMs)
+
+        if hasSpeakers {
+            let turns = TranscriptSegmenter.groupIntoSpeakerTurns(
+                segments: segments,
+                speakerLabelProvider: { speakerID in
+                    guard let speakerID else { return "Unknown" }
+                    return cachedSpeakerLabelMap[speakerID] ?? "Unknown"
+                }
+            )
+            cachedTurns = turns
+            cachedIdentifiedTurns = identifiedSpeakerTurns(turns)
+        } else {
+            cachedTurns = []
+            cachedIdentifiedTurns = []
+        }
+    }
+
+    // MARK: - Binary Search Helpers
+
+    /// Find the active segment index for the current playback time using binary search. O(log n).
+    private func activeSegmentIndex(for currentMs: Int) -> Int? {
+        guard !cachedSegmentStartMs.isEmpty else { return nil }
+
+        // Binary search: find the last segment whose startMs <= currentMs
+        var lo = 0
+        var hi = cachedSegmentStartMs.count - 1
+        var result = -1
+
+        while lo <= hi {
+            let mid = (lo + hi) / 2
+            if cachedSegmentStartMs[mid] <= currentMs {
+                result = mid
+                lo = mid + 1
+            } else {
+                hi = mid - 1
+            }
+        }
+
+        return result >= 0 ? result : nil
+    }
+
+    /// Check if a segment at the given index is active (O(1) after binary search).
+    private func isSegmentActiveBinarySearch(segmentIndex: Int) -> Bool {
+        guard playerViewModel.playbackMode != .none else { return false }
+        let currentMs = playerViewModel.currentTimeMs
+        guard currentMs > 0 else { return false }
+        guard let activeIdx = activeSegmentIndex(for: currentMs) else { return false }
+        return activeIdx == segmentIndex
+    }
+
+    /// Find the scroll target ID (segment startMs) for the given playback time using binary search.
+    private func autoScrollTarget(for currentMs: Int) -> Int? {
+        if cachedHasSpeakers {
+            // Find the last turn whose first segment starts at or before currentMs
+            for turn in cachedTurns.reversed() {
+                if let first = turn.segments.first, first.startMs <= currentMs {
+                    return first.startMs
+                }
+            }
+        } else {
+            if let idx = activeSegmentIndex(for: currentMs) {
+                return cachedSegmentStartMs[idx]
+            }
+        }
+        return nil
+    }
+
+    // MARK: - Speaker Helpers
+
+    private func buildSpeakerColorMap() -> [String: Color] {
+        guard let speakers = activeTranscription.speakers else { return [:] }
+        var map: [String: Color] = [:]
+        for (i, speaker) in speakers.enumerated() {
+            map[speaker.id] = DesignSystem.Colors.speakerColor(for: i)
+        }
+        return map
+    }
+
+    private func buildSpeakerLabelMap() -> [String: String] {
+        guard let speakers = activeTranscription.speakers else { return [:] }
+        var map: [String: String] = [:]
+        for speaker in speakers {
+            map[speaker.id] = speaker.label
+        }
+        return map
+    }
+
+    private func syncTranscriptDisplayMode() {
+        transcriptDisplayMode = (hasCleanTranscriptText || !hasTimestamps) ? .text : .timed
+    }
+
+    private func beginTranscriptEdit() {
+        transcriptDraft = transcriptText
+        transcriptEditError = nil
+        transcriptDisplayModeBeforeEdit = transcriptDisplayMode
+        editingTranscript = true
+        transcriptDisplayMode = .text
+        Task { @MainActor in
+            transcriptEditorFocused = true
+        }
+    }
+
+    private func cancelTranscriptEdit() {
+        transcriptDraft = ""
+        transcriptEditError = nil
+        editingTranscript = false
+        transcriptDisplayMode = transcriptDisplayModeBeforeEdit ?? transcriptDisplayMode
+        transcriptDisplayModeBeforeEdit = nil
+    }
+
+    private func commitTranscriptEdit() {
+        let trimmed = transcriptDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            transcriptEditError = "Transcript text cannot be empty."
+            SoundManager.shared.play(.errorSoft)
+            return
+        }
+
+        if trimmed == transcriptText {
+            cancelTranscriptEdit()
+            return
+        }
+
+        guard viewModel.updateCurrentTranscriptText(to: transcriptDraft) else {
+            transcriptEditError = "Could not save transcript edits."
+            SoundManager.shared.play(.errorSoft)
+            return
+        }
+
+        chatViewModel.loadTranscript(currentAIContextText, transcriptionId: viewModel.currentTranscription?.id)
+        transcriptDraft = ""
+        transcriptEditError = nil
+        editingTranscript = false
+        transcriptDisplayMode = .text
+        transcriptDisplayModeBeforeEdit = nil
+        SoundManager.shared.play(.transcriptionComplete)
+    }
+
+    private func revertTranscriptEdit() {
+        guard viewModel.revertCurrentTranscriptToOriginal() else { return }
+        chatViewModel.loadTranscript(currentAIContextText, transcriptionId: viewModel.currentTranscription?.id)
+        transcriptDraft = ""
+        transcriptEditError = nil
+        editingTranscript = false
+        transcriptDisplayMode = hasTimestamps ? .timed : .text
+        transcriptDisplayModeBeforeEdit = nil
+        SoundManager.shared.play(.transcriptionComplete)
+    }
+
+    // MARK: - Actions
+
+    private func copyToClipboard() {
+        let text = transcriptText
+        TranscriptResultActions.copyText(text)
+        copiedResetTask?.cancel()
+        withAnimation(DesignSystem.Animation.hoverTransition) { copied = true }
+        copiedResetTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1.5))
+            guard !Task.isCancelled else { return }
+            withAnimation(DesignSystem.Animation.hoverTransition) { copied = false }
+        }
+    }
+
+    private var hasTimestamps: Bool {
+        activeTranscription.hasWordTimestamps
+    }
+
+    private var hasAlignedTimestampsForExport: Bool {
+        hasTimestamps && !hasEditedTranscript
+    }
+
+    private var hasSpeakerLabelsForExport: Bool {
+        !hasEditedTranscript && activeTranscription.hasSpeakerLabeledWords
+    }
+
+    /// Whether "Include timestamps" applies to the current selection: the format
+    /// must take transcript options *and* the transcript must have aligned
+    /// timestamps to include.
+    private var canIncludeTimestampsOption: Bool {
+        selectedExportFormat.supportsTranscriptOptions && hasAlignedTimestampsForExport
+    }
+
+    private var canIncludeSpeakerLabelsOption: Bool {
+        selectedExportFormat.supportsTranscriptOptions && hasSpeakerLabelsForExport
+    }
+
+    /// Caption shown under a disabled "Include timestamps" toggle. `nil` when the
+    /// option is available, or when the format takes no options (the section is
+    /// hidden in that case, so no caption is needed).
+    private var timestampsUnavailableReason: String? {
+        guard selectedExportFormat.supportsTranscriptOptions,
+              !hasAlignedTimestampsForExport else { return nil }
+        if !hasTimestamps { return "This transcript has no word timestamps." }
+        return "Unavailable after editing the transcript text."
+    }
+
+    private var speakerLabelsUnavailableReason: String? {
+        guard selectedExportFormat.supportsTranscriptOptions,
+              !hasSpeakerLabelsForExport else { return nil }
+        if activeTranscription.hasSpeakerLabeledWords {
+            return "Unavailable after editing the transcript text."
+        }
+        return "This transcript has no speaker labels."
+    }
+
+    private var resolvedTranscriptExportOptions: TranscriptExportOptions {
+        transcriptExportOptions.resolved(
+            canIncludeTimestamps: hasAlignedTimestampsForExport,
+            canIncludeSpeakerLabels: hasSpeakerLabelsForExport
+        )
+    }
+
+    private var exportFormatOrder: [TranscriptExportFormat] {
+        [.txt, .md, .srt, .vtt, .json, .pdf, .docx]
+    }
+
+    private var exportOptionsPopover: some View {
+        VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
+            HStack(spacing: DesignSystem.Spacing.sm) {
+                Label("Export Transcript", systemImage: "arrow.down.doc")
+                    .font(DesignSystem.Typography.body.bold())
+
+                Spacer()
+
+                Button {
+                    showingExportOptions = false
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close export options")
+            }
+
+            VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
+                Text("Format")
+                    .font(DesignSystem.Typography.caption.weight(.medium))
+                    .foregroundStyle(DesignSystem.Colors.textSecondary)
+
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 104), spacing: 8)],
+                    alignment: .leading,
+                    spacing: 8
+                ) {
+                    ForEach(exportFormatOrder) { format in
+                        Button {
+                            selectedExportFormat = format
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: format.iconName)
+                                    .frame(width: 16)
+                                Text(format.shortName)
+                                    .lineLimit(1)
+                                    .minimumScaleFactor(0.85)
+                                Spacer(minLength: 0)
+                            }
+                            .font(DesignSystem.Typography.caption)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 7)
+                            .frame(maxWidth: .infinity)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .fill(selectedExportFormat == format
+                                          ? DesignSystem.Colors.accent.opacity(0.14)
+                                          : DesignSystem.Colors.surface)
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .strokeBorder(
+                                        selectedExportFormat == format
+                                        ? DesignSystem.Colors.accent.opacity(0.7)
+                                        : DesignSystem.Colors.border.opacity(0.7),
+                                        lineWidth: 1
+                                    )
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
+            // The Options toggles apply only to Text/Markdown. SRT/VTT are
+            // cue-only, and JSON/PDF/DOCX always include whatever the transcript
+            // has — so none of those take these toggles; showing them greyed
+            // would just be noise.
+            if selectedExportFormat.supportsTranscriptOptions {
+                VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
+                    Text("Options")
+                        .font(DesignSystem.Typography.caption.weight(.medium))
+                        .foregroundStyle(DesignSystem.Colors.textSecondary)
+
+                    exportOptionToggle(
+                        "Include timestamps",
+                        isOn: $transcriptExportOptions.includeTimestamps,
+                        isEnabled: canIncludeTimestampsOption,
+                        unavailableReason: timestampsUnavailableReason
+                    )
+
+                    exportOptionToggle(
+                        "Include speaker labels",
+                        isOn: $transcriptExportOptions.includeSpeakerLabels,
+                        isEnabled: canIncludeSpeakerLabelsOption,
+                        unavailableReason: speakerLabelsUnavailableReason
+                    )
+
+                    Toggle("Include metadata", isOn: $transcriptExportOptions.includeMetadata)
+                }
+            }
+
+            Divider()
+
+            HStack {
+                Spacer()
+                Button {
+                    showingExportOptions = false
+                    exportToDownloads(format: selectedExportFormat)
+                } label: {
+                    Label("Export", systemImage: "arrow.down.doc")
+                }
+                .parakeetAction(.primaryProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(DesignSystem.Spacing.md)
+        .frame(width: 380)
+    }
+
+    /// An export option toggle that shows its *effective* state. When the option
+    /// is unavailable it renders unchecked and disabled — rather than checked and
+    /// greyed, which reads as "forced on" and contradicts the export, which omits
+    /// the missing data. An optional caption explains why it is unavailable.
+    @ViewBuilder
+    private func exportOptionToggle(
+        _ title: String,
+        isOn: Binding<Bool>,
+        isEnabled: Bool,
+        unavailableReason: String?
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Toggle(title, isOn: Binding(
+                get: { isEnabled && isOn.wrappedValue },
+                set: { isOn.wrappedValue = $0 }
+            ))
+            .disabled(!isEnabled)
+
+            if let unavailableReason {
+                Text(unavailableReason)
+                    .font(DesignSystem.Typography.caption)
+                    .foregroundStyle(DesignSystem.Colors.textTertiary)
+            }
+        }
+    }
+
+    // MARK: - Export Confirmation Popover
+
+    @ViewBuilder
+    private func exportConfirmationPopover(_ confirmation: ExportConfirmation) -> some View {
+        VStack(alignment: .leading, spacing: DesignSystem.Spacing.sm) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 18))
+                    .foregroundStyle(DesignSystem.Colors.successGreen)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(confirmation.title)
+                        .font(DesignSystem.Typography.body.bold())
+                    Text(confirmation.url.lastPathComponent)
+                        .font(DesignSystem.Typography.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 4)
+
+                Button {
+                    dismissTask?.cancel()
+                    dismissTask = nil
+                    exportConfirmation = nil
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close export confirmation")
+                .accessibilityHint("Dismisses the export confirmation popover")
+            }
+
+            Button {
+                NSWorkspace.shared.activateFileViewerSelecting([confirmation.url])
+                dismissTask?.cancel()
+                dismissTask = nil
+                exportConfirmation = nil
+            } label: {
+                Label("Show in Finder", systemImage: "folder")
+                    .font(DesignSystem.Typography.caption)
+            }
+            .parakeetAction(.secondary)
+        }
+        .padding(DesignSystem.Spacing.md)
+        .frame(minWidth: 220)
+    }
+
+    private func exportGenerationToDownloads(promptResult: PromptResult, format: TranscriptExportFormat) {
+        let source = activeTranscription
+        do {
+            let fileURL = try TranscriptResultActions.exportPromptResultToDownloads(
+                promptResult: promptResult,
+                source: source,
+                format: format
+            )
+            exportErrorMessage = nil
+            SoundManager.shared.play(.transcriptionComplete)
+            dismissTask?.cancel()
+            exportConfirmation = ExportConfirmation(
+                url: fileURL,
+                title: "Exported \(format.displayName)"
+            )
+            dismissTask = Task { @MainActor in
+                try? await Task.sleep(for: .seconds(5.0))
+                guard !Task.isCancelled else { return }
+                exportConfirmation = nil
+            }
+        } catch let cocoaError as CocoaError where cocoaError.code == .fileNoSuchFile {
+            exportErrorMessage = "Your Downloads folder could not be found."
+            SoundManager.shared.play(.errorSoft)
+        } catch {
+            exportErrorMessage = error.localizedDescription
+            SoundManager.shared.play(.errorSoft)
+        }
+    }
+
+    private func exportToDownloads(format: TranscriptExportFormat) {
+        // Use the ViewModel's copy which reflects any in-flight renames
+        let source = activeTranscription
+        do {
+            let fileURL = try TranscriptResultActions.exportTranscriptToDownloads(
+                transcription: source,
+                format: format,
+                options: format.supportsTranscriptOptions ? resolvedTranscriptExportOptions : .default
+            )
+            exportErrorMessage = nil
+            SoundManager.shared.play(.transcriptionComplete)
+            dismissTask?.cancel()
+            exportConfirmation = ExportConfirmation(
+                url: fileURL,
+                title: "Exported \(format.displayName)"
+            )
+            dismissTask = Task { @MainActor in
+                try? await Task.sleep(for: .seconds(5.0))
+                guard !Task.isCancelled else { return }
+                exportConfirmation = nil
+            }
+        } catch let cocoaError as CocoaError where cocoaError.code == .fileNoSuchFile {
+            exportErrorMessage = "Your Downloads folder could not be found."
+            SoundManager.shared.play(.errorSoft)
+        } catch {
+            exportErrorMessage = error.localizedDescription
+            SoundManager.shared.play(.errorSoft)
+        }
+    }
+
+    /// Drives the "Save Audio As…" item in the meeting action bar's
+    /// Audio menu. Reuses the existing exportConfirmation popover on
+    /// success and the existing exportErrorMessage alert on failure.
+    private func saveMeetingAudioFromActionBar() {
+        let source = activeTranscription
+        Task { @MainActor in
+            do {
+                let outcome = try await MeetingAudioActions.runSaveAudioPanel(for: source)
+                switch outcome {
+                case .saved(let destination):
+                    SoundManager.shared.play(.transcriptionComplete)
+                    dismissTask?.cancel()
+                    exportConfirmation = ExportConfirmation(
+                        url: destination,
+                        title: "Saved Audio"
+                    )
+                    dismissTask = Task { @MainActor in
+                        try? await Task.sleep(for: .seconds(5.0))
+                        guard !Task.isCancelled else { return }
+                        exportConfirmation = nil
+                    }
+                case .cancelled:
+                    break
+                case .sourceUnavailable:
+                    exportErrorMessage = "The meeting audio file is no longer available."
+                    SoundManager.shared.play(.errorSoft)
+                }
+            } catch {
+                exportErrorMessage = error.localizedDescription
+                SoundManager.shared.play(.errorSoft)
+            }
+        }
+    }
+
+    private func deleteMeetingAudioFromActionBar() {
+        viewModel.deleteMeetingAudio(activeTranscription)
+    }
+
+    private func formatTimestamp(ms: Int) -> String {
+        let totalSeconds = ms / 1000
+        let minutes = totalSeconds / 60
+        let seconds = totalSeconds % 60
+        return String(format: "%02d:%02d", minutes, seconds)
+    }
+}
+
+private struct EngineOptionCard: View {
+    let selection: SpeechEngineSelection
+    let nemotronVariant: NemotronModelVariant
+    let parakeetVariant: ParakeetModelVariant
+    let isPrimary: Bool
+    /// When this is the primary card, whether it names the engine that produced
+    /// the transcript ("Original") rather than a fall-back to the user's current
+    /// default ("Current"). Ignored on non-primary cards.
+    let primaryReflectsTranscriptEngine: Bool
+    let isAvailable: Bool
+    let unavailableReason: String?
+    let advisory: String?
+    let onSelect: () -> Void
+
+    @State private var hovering = false
+
+    private var iconName: String {
+        switch selection.engine {
+        case .parakeet: "bolt.fill"
+        case .nemotron: "sparkles"
+        case .whisper: "globe"
+        case .cohere: "waveform"
+        }
+    }
+
+    private var subtitle: String {
+        switch selection.engine {
+        case .parakeet:
+            switch parakeetVariant {
+            case .v3: "Fast local default • word timestamps"
+            case .v2: "English stability • word timestamps"
+            case .unified: "Readable English • word timestamps"
+            }
+        case .nemotron:
+            nemotronVariant.isEnglishOnly
+                ? "Beta English streaming • quality still being validated"
+                : "Beta multilingual streaming • quality varies by language"
+        case .whisper:
+            "Broad-language fallback • files and saved audio"
+        case .cohere:
+            "Batch plain text • no timestamps or speaker labels"
+        }
+    }
+
+    private var languageDetail: String? {
+        guard selection.engine == .whisper || selection.engine == .nemotron else { return nil }
+        if selection.engine == .nemotron, nemotronVariant.isEnglishOnly {
+            // The English-only build ignores language hints.
+            return "Language: English"
+        }
+        let language = selection.language ?? "auto-detect"
+        return "Language: \(language)"
+    }
+
+    var body: some View {
+        Button(action: onSelect) {
+            HStack(alignment: .top, spacing: DesignSystem.Spacing.sm) {
+                Image(systemName: iconName)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(iconColor)
+                    .frame(width: 22, height: 22)
+                    .padding(.top, 1)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Text(selection.engine.displayName)
+                            .font(DesignSystem.Typography.body.weight(.semibold))
+                            .foregroundStyle(titleColor)
+                        if isPrimary {
+                            EngineBadge(
+                                text: primaryReflectsTranscriptEngine ? "Original" : "Current",
+                                tint: DesignSystem.Colors.accent
+                            )
+                        }
+                        if !isAvailable {
+                            EngineBadge(text: "Unavailable", tint: DesignSystem.Colors.warningAmber)
+                        }
+                    }
+                    .lineLimit(1)
+
+                    Text(subtitle)
+                        .font(DesignSystem.Typography.caption)
+                        .foregroundStyle(DesignSystem.Colors.textSecondary)
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if let languageDetail {
+                        Text(languageDetail)
+                            .font(DesignSystem.Typography.caption)
+                            .foregroundStyle(DesignSystem.Colors.textTertiary)
+                    }
+
+                    if let advisory, isAvailable {
+                        Text(advisory)
+                            .font(DesignSystem.Typography.caption)
+                            .foregroundStyle(DesignSystem.Colors.textTertiary)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    if let unavailableReason, !isAvailable {
+                        Text(unavailableReason)
+                            .font(DesignSystem.Typography.caption)
+                            .foregroundStyle(DesignSystem.Colors.textSecondary)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.top, 1)
+                    }
+                }
+
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, DesignSystem.Spacing.sm + 2)
+            .padding(.horizontal, DesignSystem.Spacing.sm + 2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(backgroundFill)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(borderColor, lineWidth: 1)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!isAvailable)
+        .onHover { isHovering in
+            guard isAvailable else { return }
+            withAnimation(DesignSystem.Animation.hoverTransition) {
+                hovering = isHovering
+            }
+        }
+        .help(helpText)
+        .accessibilityLabel(Text(accessibilityLabel))
+        .accessibilityHint(Text(accessibilityHint))
+    }
+
+    private var helpText: String {
+        if !isAvailable {
+            return unavailableReason ?? "Unavailable for this rerun."
+        }
+        if let advisory {
+            return "\(advisory) Rerun with \(selection.engine.displayName)."
+        }
+        return "Rerun with \(selection.engine.displayName)."
+    }
+
+    private var iconColor: Color {
+        guard isAvailable else { return DesignSystem.Colors.textTertiary }
+        return DesignSystem.Colors.accent
+    }
+
+    private var titleColor: Color {
+        isAvailable ? DesignSystem.Colors.textPrimary : DesignSystem.Colors.textSecondary
+    }
+
+    private var backgroundFill: Color {
+        if !isAvailable {
+            return DesignSystem.Colors.surfaceElevated.opacity(0.5)
+        }
+        return hovering ? DesignSystem.Colors.accentLight : DesignSystem.Colors.surfaceElevated
+    }
+
+    private var borderColor: Color {
+        if !isAvailable {
+            return DesignSystem.Colors.border.opacity(0.6)
+        }
+        return hovering ? DesignSystem.Colors.accent.opacity(0.5) : DesignSystem.Colors.border
+    }
+
+    private var accessibilityLabel: String {
+        var parts = [selection.engine.displayName]
+        if isPrimary {
+            parts.append(primaryReflectsTranscriptEngine ? "engine used for this transcript" : "current engine")
+        }
+        if !isAvailable { parts.append("unavailable") }
+        return parts.joined(separator: ", ")
+    }
+
+    private var accessibilityHint: String {
+        if !isAvailable {
+            return unavailableReason ?? "Unavailable for this rerun."
+        }
+        if let advisory {
+            return "\(advisory) Reruns this transcription with \(selection.engine.displayName)."
+        }
+        return "Reruns this transcription with \(selection.engine.displayName)."
+    }
+}
+
+private struct EngineBadge: View {
+    let text: String
+    let tint: Color
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(tint)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(tint.opacity(0.14))
+            )
+            .overlay(
+                Capsule(style: .continuous)
+                    .stroke(tint.opacity(0.28), lineWidth: 0.5)
+            )
+    }
+}
+
+private extension String {
+    func stringIndex(utf16Offset: Int) -> String.Index? {
+        guard utf16Offset >= 0,
+              let utf16Index = utf16.index(utf16.startIndex, offsetBy: utf16Offset, limitedBy: utf16.endIndex) else {
+            return nil
+        }
+        return String.Index(utf16Index, within: self)
+    }
+}

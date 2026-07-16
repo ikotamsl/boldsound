@@ -1,0 +1,1631 @@
+import XCTest
+@testable import MacParakeetCore
+
+// MARK: - Mock URL Protocol
+
+private final class MockURLProtocol: URLProtocol {
+    nonisolated(unsafe) static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let handler = Self.handler else {
+            client?.urlProtocolDidFinishLoading(self)
+            return
+        }
+
+        do {
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+final class LLMClientTests: XCTestCase {
+    var llmClient: LLMClient!
+    var session: URLSession!
+
+    override func setUp() {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockURLProtocol.self]
+        session = URLSession(configuration: config)
+        llmClient = LLMClient(session: session)
+    }
+
+    override func tearDown() {
+        MockURLProtocol.handler = nil
+    }
+
+    // MARK: - URL Construction
+
+    func testRequestURLAppendsChatCompletions() async throws {
+        var capturedRequest: URLRequest?
+
+        MockURLProtocol.handler = { request in
+            capturedRequest = request
+            return (self.okResponse(for: request), self.validResponseData())
+        }
+
+        let config = LLMProviderConfig.openai(apiKey: "sk-test")
+        _ = try await llmClient.chatCompletion(
+            messages: [ChatMessage(role: .user, content: "Hello")],
+            config: config,
+            options: .default
+        )
+
+        XCTAssertEqual(capturedRequest?.url?.absoluteString, "https://api.openai.com/v1/chat/completions")
+        XCTAssertEqual(capturedRequest?.httpMethod, "POST")
+    }
+
+    // MARK: - Auth Headers
+
+    func testOpenAIAuthHeaderSetFromAPIKey() async throws {
+        var capturedRequest: URLRequest?
+
+        MockURLProtocol.handler = { request in
+            capturedRequest = request
+            return (self.okResponse(for: request), self.validResponseData())
+        }
+
+        let config = LLMProviderConfig.openai(apiKey: "sk-test-key")
+        _ = try await llmClient.chatCompletion(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: config,
+            options: .default
+        )
+
+        XCTAssertEqual(capturedRequest?.value(forHTTPHeaderField: "Authorization"), "Bearer sk-test-key")
+        XCTAssertEqual(capturedRequest?.value(forHTTPHeaderField: "Content-Type"), "application/json")
+    }
+
+    // MARK: - Anthropic Native API
+
+    func testAnthropicUsesNativeMessagesEndpoint() async throws {
+        var capturedRequest: URLRequest?
+
+        MockURLProtocol.handler = { request in
+            capturedRequest = request
+            return (self.okResponse(for: request), self.validAnthropicResponseData())
+        }
+
+        let config = LLMProviderConfig.anthropic(apiKey: "sk-ant-test-key")
+        _ = try await llmClient.chatCompletion(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: config,
+            options: .default
+        )
+
+        // Should use /v1/messages, NOT /v1/chat/completions
+        XCTAssertTrue(capturedRequest?.url?.path.hasSuffix("/messages") == true,
+                       "Anthropic should use /messages endpoint, got: \(capturedRequest?.url?.path ?? "nil")")
+        // Should use x-api-key, NOT Bearer
+        XCTAssertEqual(capturedRequest?.value(forHTTPHeaderField: "x-api-key"), "sk-ant-test-key")
+        XCTAssertNil(capturedRequest?.value(forHTTPHeaderField: "Authorization"))
+        // Should include the current Anthropic API version pin.
+        XCTAssertEqual(capturedRequest?.value(forHTTPHeaderField: "anthropic-version"), "2023-06-01")
+    }
+
+    func testAnthropicExtractsSystemPrompt() async throws {
+        var capturedBody: [String: Any]?
+
+        MockURLProtocol.handler = { request in
+            if let body = self.extractBody(from: request) {
+                capturedBody = body
+            }
+            return (self.okResponse(for: request), self.validAnthropicResponseData())
+        }
+
+        let config = LLMProviderConfig.anthropic(apiKey: "sk-ant-test-key")
+        _ = try await llmClient.chatCompletion(
+            messages: [
+                ChatMessage(role: .system, content: "You are helpful."),
+                ChatMessage(role: .user, content: "Hi"),
+            ],
+            config: config,
+            options: .default
+        )
+
+        // System prompt should be a top-level field, not in messages
+        XCTAssertEqual(capturedBody?["system"] as? String, "You are helpful.")
+        let messages = capturedBody?["messages"] as? [[String: String]]
+        XCTAssertEqual(messages?.count, 1, "System message should be extracted from messages array")
+        XCTAssertEqual(messages?[0]["role"], "user")
+    }
+
+    func testAnthropicResponseParsedCorrectly() async throws {
+        MockURLProtocol.handler = { request in
+            return (self.okResponse(for: request), self.validAnthropicResponseData())
+        }
+
+        let config = LLMProviderConfig.anthropic(apiKey: "sk-ant-test-key")
+        let response = try await llmClient.chatCompletion(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: config,
+            options: .default
+        )
+
+        XCTAssertEqual(response.content, "Hello!")
+        XCTAssertEqual(response.model, "claude-sonnet-4-6")
+        XCTAssertEqual(response.usage?.promptTokens, 10)
+        XCTAssertEqual(response.usage?.completionTokens, 5)
+        XCTAssertEqual(response.finishReason, "end_turn")
+    }
+
+    func testAnthropicIncludesMaxTokens() async throws {
+        var capturedBody: [String: Any]?
+
+        MockURLProtocol.handler = { request in
+            if let body = self.extractBody(from: request) {
+                capturedBody = body
+            }
+            return (self.okResponse(for: request), self.validAnthropicResponseData())
+        }
+
+        let config = LLMProviderConfig.anthropic(apiKey: "sk-ant-test-key")
+        _ = try await llmClient.chatCompletion(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: config,
+            options: ChatCompletionOptions(maxTokens: 1000)
+        )
+
+        XCTAssertEqual(capturedBody?["max_tokens"] as? Int, 1000)
+    }
+
+    func testAnthropicOmitsTemperature() async throws {
+        var capturedBody: [String: Any]?
+
+        MockURLProtocol.handler = { request in
+            if let body = self.extractBody(from: request) {
+                capturedBody = body
+            }
+            return (self.okResponse(for: request), self.validAnthropicResponseData())
+        }
+
+        let config = LLMProviderConfig.anthropic(apiKey: "sk-ant-test-key")
+        _ = try await llmClient.chatCompletion(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: config,
+            options: ChatCompletionOptions(temperature: 0.25, maxTokens: 1000)
+        )
+
+        XCTAssertNil(capturedBody?["temperature"])
+    }
+
+    func testAnthropicSendsTemperatureToLegacyModels() async throws {
+        var capturedBody: [String: Any]?
+
+        MockURLProtocol.handler = { request in
+            if let body = self.extractBody(from: request) {
+                capturedBody = body
+            }
+            return (self.okResponse(for: request), self.validAnthropicResponseData())
+        }
+
+        let config = LLMProviderConfig.anthropic(apiKey: "sk-ant-test-key", model: "claude-sonnet-4-6")
+        _ = try await llmClient.chatCompletion(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: config,
+            options: ChatCompletionOptions(temperature: 0.25, maxTokens: 1000)
+        )
+
+        XCTAssertEqual(capturedBody?["temperature"] as? Double, 0.25)
+    }
+
+    func testAnthropicTemperatureModelAllowList() {
+        XCTAssertTrue(AnthropicLLMHTTPAdapter.modelAcceptsTemperature("claude-sonnet-4-6"))
+        XCTAssertTrue(AnthropicLLMHTTPAdapter.modelAcceptsTemperature("claude-haiku-4-5"))
+        XCTAssertTrue(AnthropicLLMHTTPAdapter.modelAcceptsTemperature("claude-sonnet-4-20250514"))
+        XCTAssertTrue(AnthropicLLMHTTPAdapter.modelAcceptsTemperature("claude-3-5-haiku-20241022"))
+        XCTAssertFalse(AnthropicLLMHTTPAdapter.modelAcceptsTemperature("claude-sonnet-5"))
+        XCTAssertFalse(AnthropicLLMHTTPAdapter.modelAcceptsTemperature("claude-opus-4-7"))
+        XCTAssertFalse(AnthropicLLMHTTPAdapter.modelAcceptsTemperature("claude-opus-4-8"))
+        XCTAssertFalse(AnthropicLLMHTTPAdapter.modelAcceptsTemperature("claude-fable-5"))
+        XCTAssertFalse(AnthropicLLMHTTPAdapter.modelAcceptsTemperature("claude-sonnet-6"))
+        XCTAssertFalse(AnthropicLLMHTTPAdapter.modelAcceptsTemperature("claude-sonnet-4-01"))
+        XCTAssertFalse(AnthropicLLMHTTPAdapter.modelAcceptsTemperature("claude-opus-4-07"))
+    }
+
+    func testOllamaUsesNativeAPI() async throws {
+        var capturedRequest: URLRequest?
+
+        MockURLProtocol.handler = { request in
+            capturedRequest = request
+            return (self.okResponse(for: request), self.validOllamaResponseData())
+        }
+
+        let config = LLMProviderConfig.ollama(model: "qwen3.5:4b")
+        _ = try await llmClient.chatCompletion(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: config,
+            options: .default
+        )
+
+        // Should hit native /api/chat, not /v1/chat/completions
+        XCTAssertTrue(capturedRequest?.url?.path.contains("/api/chat") == true)
+        // No auth header for native API
+        XCTAssertNil(capturedRequest?.value(forHTTPHeaderField: "Authorization"))
+    }
+
+    func testCustomProviderWithNoAPIKeyOmitsAuthHeader() async throws {
+        var capturedRequest: URLRequest?
+
+        MockURLProtocol.handler = { request in
+            capturedRequest = request
+            return (self.okResponse(for: request), self.validResponseData())
+        }
+
+        let config = LLMProviderConfig(
+            id: .openaiCompatible,
+            baseURL: URL(string: "http://localhost:8080/v1")!,
+            apiKey: nil,
+            modelName: "test-model",
+            isLocal: false
+        )
+        _ = try await llmClient.chatCompletion(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: config,
+            options: .default
+        )
+
+        XCTAssertNil(capturedRequest?.value(forHTTPHeaderField: "Authorization"))
+    }
+
+    func testLMStudioAuthHeaderSetFromOptionalAPIKey() async throws {
+        var capturedRequest: URLRequest?
+
+        MockURLProtocol.handler = { request in
+            capturedRequest = request
+            return (self.okResponse(for: request), self.validResponseData())
+        }
+
+        let config = LLMProviderConfig.lmstudio(apiKey: "lm-token", model: "local-model")
+        _ = try await llmClient.chatCompletion(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: config,
+            options: .default
+        )
+
+        XCTAssertEqual(capturedRequest?.url?.absoluteString, "http://localhost:1234/v1/chat/completions")
+        XCTAssertEqual(capturedRequest?.value(forHTTPHeaderField: "Authorization"), "Bearer lm-token")
+    }
+
+    // MARK: - Request Body
+
+    func testRequestBodyContainsModelAndMessages() async throws {
+        var capturedBody: [String: Any]?
+
+        MockURLProtocol.handler = { request in
+            if let body = self.extractBody(from: request) {
+                capturedBody = body
+            }
+            return (self.okResponse(for: request), self.validResponseData())
+        }
+
+        let config = LLMProviderConfig.openai(apiKey: "sk-test", model: "gpt-4o-mini")
+        _ = try await llmClient.chatCompletion(
+            messages: [
+                ChatMessage(role: .system, content: "You are helpful."),
+                ChatMessage(role: .user, content: "Hi"),
+            ],
+            config: config,
+            options: ChatCompletionOptions(temperature: 0.5, maxTokens: 100)
+        )
+
+        XCTAssertEqual(capturedBody?["model"] as? String, "gpt-4o-mini")
+        XCTAssertEqual(capturedBody?["stream"] as? Bool, false)
+        XCTAssertEqual(capturedBody?["temperature"] as? Double, 0.5)
+        XCTAssertEqual(capturedBody?["max_tokens"] as? Int, 100)
+
+        let messages = capturedBody?["messages"] as? [[String: String]]
+        XCTAssertEqual(messages?.count, 2)
+        XCTAssertEqual(messages?[0]["role"], "system")
+        XCTAssertEqual(messages?[0]["content"], "You are helpful.")
+        XCTAssertEqual(messages?[1]["role"], "user")
+        XCTAssertEqual(messages?[1]["content"], "Hi")
+    }
+
+    // MARK: - Response Parsing
+
+    func testValidResponseParsedCorrectly() async throws {
+        MockURLProtocol.handler = { request in
+            let json = """
+            {
+                "model": "gpt-4o",
+                "choices": [{"message": {"content": "Hello there!"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+            }
+            """
+            return (self.okResponse(for: request), Data(json.utf8))
+        }
+
+        let config = LLMProviderConfig.openai(apiKey: "sk-test")
+        let response = try await llmClient.chatCompletion(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: config,
+            options: .default
+        )
+
+        XCTAssertEqual(response.content, "Hello there!")
+        XCTAssertEqual(response.model, "gpt-4o")
+        XCTAssertEqual(response.usage?.promptTokens, 10)
+        XCTAssertEqual(response.usage?.completionTokens, 5)
+    }
+
+    func testOllamaResponsePassesThroughDoneReason() async throws {
+        MockURLProtocol.handler = { request in
+            return (self.okResponse(for: request), self.validOllamaResponseData())
+        }
+
+        let config = LLMProviderConfig.ollama(model: "qwen3.5:4b")
+        let response = try await llmClient.chatCompletion(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: config,
+            options: .default
+        )
+
+        XCTAssertEqual(response.finishReason, "stop")
+    }
+
+    func testOllamaResponseWithoutUsageFieldsEmitsNilUsage() async throws {
+        // Locks the fix for the partial-usage fabrication bug: when Ollama
+        // returns a response without `prompt_eval_count` / `eval_count`, the
+        // client must emit `usage: nil` rather than synthesizing
+        // `TokenUsage(0, 0)` — otherwise the public `--json` envelope would
+        // surface a fabricated `totalTokens: 0` indistinguishable from a
+        // real zero-token response.
+        MockURLProtocol.handler = { request in
+            let json = """
+            {"model":"qwen3.5:4b","message":{"role":"assistant","content":"OK"},"done":true}
+            """
+            return (self.okResponse(for: request), Data(json.utf8))
+        }
+
+        let config = LLMProviderConfig.ollama(model: "qwen3.5:4b")
+        let response = try await llmClient.chatCompletion(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: config,
+            options: .default
+        )
+
+        XCTAssertEqual(response.content, "OK")
+        XCTAssertNil(response.usage)
+    }
+
+    func testInvalidResponseThrowsInvalidResponse() async {
+        MockURLProtocol.handler = { request in
+            return (self.okResponse(for: request), Data("not json".utf8))
+        }
+
+        let config = LLMProviderConfig.openai(apiKey: "sk-test")
+        do {
+            _ = try await llmClient.chatCompletion(
+                messages: [ChatMessage(role: .user, content: "Hi")],
+                config: config,
+                options: .default
+            )
+            XCTFail("Expected LLMError.invalidResponse")
+        } catch let error as LLMError {
+            if case .invalidResponse = error {} else {
+                XCTFail("Expected invalidResponse, got \(error)")
+            }
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+    }
+
+    // MARK: - Error Mapping
+
+    func testUnauthorizedThrowsAuthenticationFailed() async {
+        MockURLProtocol.handler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 401, httpVersion: nil, headerFields: nil
+            )!
+            return (response, Data("{\"error\":{\"message\":\"Invalid API key\"}}".utf8))
+        }
+
+        let config = LLMProviderConfig.openai(apiKey: "bad-key")
+        do {
+            _ = try await llmClient.chatCompletion(
+                messages: [ChatMessage(role: .user, content: "Hi")],
+                config: config,
+                options: .default
+            )
+            XCTFail("Expected LLMError.authenticationFailed")
+        } catch let error as LLMError {
+            if case .authenticationFailed = error {} else {
+                XCTFail("Expected authenticationFailed, got \(error)")
+            }
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+    }
+
+    func testRateLimitThrowsRateLimited() async {
+        MockURLProtocol.handler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 429, httpVersion: nil, headerFields: nil
+            )!
+            return (response, Data("{\"error\":{\"message\":\"Rate limit exceeded\"}}".utf8))
+        }
+
+        let config = LLMProviderConfig.openai(apiKey: "sk-test")
+        do {
+            _ = try await llmClient.chatCompletion(
+                messages: [ChatMessage(role: .user, content: "Hi")],
+                config: config,
+                options: .default
+            )
+            XCTFail("Expected LLMError.rateLimited")
+        } catch let error as LLMError {
+            if case .rateLimited = error {} else {
+                XCTFail("Expected rateLimited, got \(error)")
+            }
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+    }
+
+    func testNotFoundThrowsModelNotFound() async {
+        MockURLProtocol.handler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil
+            )!
+            return (response, Data("{\"error\":{\"message\":\"Model not found\"}}".utf8))
+        }
+
+        let config = LLMProviderConfig.openai(apiKey: "sk-test", model: "nonexistent")
+        do {
+            _ = try await llmClient.chatCompletion(
+                messages: [ChatMessage(role: .user, content: "Hi")],
+                config: config,
+                options: .default
+            )
+            XCTFail("Expected LLMError.modelNotFound")
+        } catch let error as LLMError {
+            if case .modelNotFound = error {} else {
+                XCTFail("Expected modelNotFound, got \(error)")
+            }
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+    }
+
+    func testGenericNotFoundReturnsProviderError() async {
+        MockURLProtocol.handler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil
+            )!
+            return (response, Data("{\"error\":{\"message\":\"Route not found\"}}".utf8))
+        }
+
+        let config = LLMProviderConfig.openai(apiKey: "sk-test")
+        do {
+            _ = try await llmClient.chatCompletion(
+                messages: [ChatMessage(role: .user, content: "Hi")],
+                config: config,
+                options: .default
+            )
+            XCTFail("Expected LLMError.providerError")
+        } catch let error as LLMError {
+            if case .providerError(let msg) = error {
+                XCTAssertEqual(msg, "Route not found")
+            } else {
+                XCTFail("Expected providerError, got \(error)")
+            }
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+    }
+
+    func testContextLengthErrorMappedCorrectly() async {
+        MockURLProtocol.handler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 400, httpVersion: nil, headerFields: nil
+            )!
+            return (response, Data("{\"error\":{\"message\":\"This model's maximum context length is exceeded\"}}".utf8))
+        }
+
+        let config = LLMProviderConfig.openai(apiKey: "sk-test")
+        do {
+            _ = try await llmClient.chatCompletion(
+                messages: [ChatMessage(role: .user, content: "Hi")],
+                config: config,
+                options: .default
+            )
+            XCTFail("Expected LLMError.contextTooLong")
+        } catch let error as LLMError {
+            if case .contextTooLong = error {} else {
+                XCTFail("Expected contextTooLong, got \(error)")
+            }
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+    }
+
+    func testServerErrorReturnsProviderError() async {
+        MockURLProtocol.handler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 500, httpVersion: nil, headerFields: nil
+            )!
+            return (response, Data("{\"error\":{\"message\":\"Internal server error\"}}".utf8))
+        }
+
+        let config = LLMProviderConfig.openai(apiKey: "sk-test")
+        do {
+            _ = try await llmClient.chatCompletion(
+                messages: [ChatMessage(role: .user, content: "Hi")],
+                config: config,
+                options: .default
+            )
+            XCTFail("Expected LLMError.providerError")
+        } catch let error as LLMError {
+            if case .providerError(let msg) = error {
+                XCTAssertEqual(msg, "Internal server error")
+            } else {
+                XCTFail("Expected providerError, got \(error)")
+            }
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+    }
+
+    // MARK: - Test Connection
+
+    func testTestConnectionSendsMinimalRequest() async throws {
+        var capturedBody: [String: Any]?
+
+        MockURLProtocol.handler = { request in
+            if let body = self.extractBody(from: request) {
+                capturedBody = body
+            }
+            return (self.okResponse(for: request), self.validResponseData())
+        }
+
+        let config = LLMProviderConfig.openai(apiKey: "sk-test", model: "gpt-4.1")
+        try await llmClient.testConnection(config: config)
+
+        XCTAssertEqual(capturedBody?["max_tokens"] as? Int, 1)
+    }
+
+    // MARK: - SSE Parsing
+
+    func testParseSSELineWithValidContent() {
+        let result = llmClient.parseSSELine("data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}")
+        if case .content(let text) = result {
+            XCTAssertEqual(text, "Hello")
+        } else {
+            XCTFail("Expected .content, got \(result)")
+        }
+    }
+
+    func testParseSSELineExtractsDifferentContent() {
+        let result = llmClient.parseSSELine("data: {\"choices\":[{\"delta\":{\"content\":\"World 123!\"}}]}")
+        if case .content(let text) = result {
+            XCTAssertEqual(text, "World 123!")
+        } else {
+            XCTFail("Expected .content, got \(result)")
+        }
+    }
+
+    func testParseSSELineDoneReturnsDone() {
+        let result = llmClient.parseSSELine("data: [DONE]")
+        if case .done = result {} else {
+            XCTFail("Expected .done, got \(result)")
+        }
+    }
+
+    func testParseSSELineBlankLine() {
+        let result = llmClient.parseSSELine("")
+        if case .skip = result {} else {
+            XCTFail("Expected .skip, got \(result)")
+        }
+    }
+
+    func testParseSSELineRoleOnlyFrame() {
+        let result = llmClient.parseSSELine("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}")
+        if case .skip = result {} else {
+            XCTFail("Expected .skip, got \(result)")
+        }
+    }
+
+    func testParseSSELineEmptyDelta() {
+        let result = llmClient.parseSSELine("data: {\"choices\":[{\"delta\":{}}]}")
+        if case .skip = result {} else {
+            XCTFail("Expected .skip, got \(result)")
+        }
+    }
+
+    func testParseSSELineEmptyContent() {
+        let result = llmClient.parseSSELine("data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}")
+        if case .skip = result {} else {
+            XCTFail("Expected .skip, got \(result)")
+        }
+    }
+
+    func testParseSSELineFinishReason() {
+        let result = llmClient.parseSSELine("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}")
+        if case .skip = result {} else {
+            XCTFail("Expected .skip, got \(result)")
+        }
+    }
+
+    func testParseSSELineNonDataPrefix() {
+        let result = llmClient.parseSSELine("event: message")
+        if case .skip = result {} else {
+            XCTFail("Expected .skip, got \(result)")
+        }
+    }
+
+    func testParseSSELineMalformedJSON() {
+        let result = llmClient.parseSSELine("data: {\"invalid json}")
+        if case .skip = result {} else {
+            XCTFail("Expected .skip, got \(result)")
+        }
+    }
+
+    func testParseSSELineLMStudioErrorObject() {
+        let result = llmClient.parseSSELine("""
+        data: {"error":{"message":"The number of tokens to keep from the initial prompt is greater than the context length."},"message":"The number of tokens to keep from the initial prompt is greater than the context length."}
+        """)
+        if case .error(let message) = result {
+            XCTAssertTrue(message.contains("context length"))
+        } else {
+            XCTFail("Expected .error, got \(result)")
+        }
+    }
+
+    func testParseSSELineDataWithNoSpace() {
+        let result = llmClient.parseSSELine("data:{\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}")
+        if case .content(let text) = result {
+            XCTAssertEqual(text, "Hi")
+        } else {
+            XCTFail("Expected .content, got \(result)")
+        }
+    }
+
+    func testParseSSEEventCombinesMultilineDataPayload() {
+        let result = llmClient.parseSSEEvent([
+            "data: {\"choices\":[{\"delta\":",
+            "data: {\"content\":\"Hello\"}}]}",
+        ])
+        if case .content(let text) = result {
+            XCTAssertEqual(text, "Hello")
+        } else {
+            XCTFail("Expected .content, got \(result)")
+        }
+    }
+
+    func testParseSSEEventIgnoresNonDataLines() {
+        let result = llmClient.parseSSEEvent([
+            "event: message",
+            "id: 123",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}",
+        ])
+        if case .content(let text) = result {
+            XCTAssertEqual(text, "Hello")
+        } else {
+            XCTFail("Expected .content, got \(result)")
+        }
+    }
+
+    func testParseSSEEventDoneReturnsDone() {
+        let result = llmClient.parseSSEEvent([
+            "data: [DONE]",
+        ])
+        if case .done = result {} else {
+            XCTFail("Expected .done, got \(result)")
+        }
+    }
+
+    func testParseSSEEventEmptyLinesReturnsSkip() {
+        let result = llmClient.parseSSEEvent([])
+        if case .skip = result {} else {
+            XCTFail("Expected .skip, got \(result)")
+        }
+    }
+
+    func testParseSSELineTruncatedJSONSkips() {
+        // Provider sends incomplete JSON (e.g. network cut mid-frame)
+        let result = llmClient.parseSSELine("data: {\"choices\":[{\"delta\":{\"content\":\"Hel")
+        if case .skip = result {} else {
+            XCTFail("Expected .skip for truncated JSON, got \(result)")
+        }
+    }
+
+    func testParseSSELineEmptyChoicesSkips() {
+        let result = llmClient.parseSSELine("data: {\"choices\":[]}")
+        if case .skip = result {} else {
+            XCTFail("Expected .skip for empty choices, got \(result)")
+        }
+    }
+
+    func testValidateStreamCompletionAcceptsMissingSentinelForLenientProvider() {
+        // Lenient providers (Gemini, OpenAI-Compatible aggregators, LM Studio,
+        // Ollama, localCLI) don't always send a sentinel. Accept clean EOF.
+        for provider in [LLMProviderID.gemini, .openaiCompatible, .lmstudio, .ollama, .localCLI] {
+            XCTAssertNoThrow(
+                try llmClient.validateStreamCompletion(
+                    providerID: provider,
+                    sawSentinel: false,
+                    yieldedAnyContent: true
+                ),
+                "Lenient provider \(provider) should not throw on missing sentinel"
+            )
+        }
+    }
+
+    func testValidateStreamCompletionThrowsWhenLenientProviderYieldsNoContent() {
+        for provider in [LLMProviderID.gemini, .openaiCompatible, .lmstudio, .ollama, .localCLI] {
+            XCTAssertThrowsError(
+                try llmClient.validateStreamCompletion(
+                    providerID: provider,
+                    sawSentinel: false,
+                    yieldedAnyContent: false
+                ),
+                "Provider \(provider) should not treat an empty stream as success"
+            ) { error in
+                guard let llmError = error as? LLMError, case .streamingError(let detail) = llmError else {
+                    XCTFail("Expected LLMError.streamingError for \(provider), got \(error)")
+                    return
+                }
+                XCTAssertTrue(detail.contains("no content"), "Detail should mention no content; got: \(detail)")
+            }
+        }
+    }
+
+    func testValidateStreamCompletionAcceptsSentinelForStrictProvider() throws {
+        for provider in [LLMProviderID.openai, .openrouter, .anthropic] {
+            XCTAssertNoThrow(
+                try llmClient.validateStreamCompletion(
+                    providerID: provider,
+                    sawSentinel: true,
+                    yieldedAnyContent: true
+                ),
+                "Strict provider \(provider) should accept proper sentinel"
+            )
+        }
+    }
+
+    func testValidateStreamCompletionThrowsOnMissingSentinelForStrictProvider() {
+        // OpenAI / OpenRouter / Anthropic contractually emit a stream terminator.
+        // EOF without it means the connection dropped mid-response; treat as
+        // truncated rather than silently look successful (AUDIT-036 P0).
+        for provider in [LLMProviderID.openai, .openrouter, .anthropic] {
+            XCTAssertThrowsError(
+                try llmClient.validateStreamCompletion(
+                    providerID: provider,
+                    sawSentinel: false,
+                    yieldedAnyContent: true
+                ),
+                "Strict provider \(provider) must throw on missing sentinel"
+            ) { error in
+                guard let llmError = error as? LLMError, case .streamingError = llmError else {
+                    XCTFail("Expected LLMError.streamingError for \(provider), got \(error)")
+                    return
+                }
+            }
+        }
+    }
+
+    func testValidateStreamCompletionDistinguishesNoContentFromTruncation() {
+        // The error detail differentiates "no content delivered" (likely
+        // backend issue) from "some content then EOF" (truncation) so
+        // downstream telemetry / logs can split the two failure modes.
+        do {
+            try llmClient.validateStreamCompletion(
+                providerID: .openai,
+                sawSentinel: false,
+                yieldedAnyContent: false
+            )
+            XCTFail("Expected throw")
+        } catch let error as LLMError {
+            guard case .streamingError(let detail) = error else {
+                XCTFail("Expected streamingError, got \(error)")
+                return
+            }
+            XCTAssertTrue(detail.contains("no content"), "Detail should mention no content; got: \(detail)")
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+
+        do {
+            try llmClient.validateStreamCompletion(
+                providerID: .openai,
+                sawSentinel: false,
+                yieldedAnyContent: true
+            )
+            XCTFail("Expected throw")
+        } catch let error as LLMError {
+            guard case .streamingError(let detail) = error else {
+                XCTFail("Expected streamingError, got \(error)")
+                return
+            }
+            XCTAssertTrue(detail.contains("truncated"), "Detail should mention truncation; got: \(detail)")
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+    }
+
+    // MARK: - OpenAI Reasoning Model Handling
+
+    func testReasoningModelUsesMaxCompletionTokens() async throws {
+        var capturedBody: [String: Any]?
+
+        MockURLProtocol.handler = { request in
+            if let body = self.extractBody(from: request) {
+                capturedBody = body
+            }
+            return (self.okResponse(for: request), self.validResponseData())
+        }
+
+        let config = LLMProviderConfig.openai(apiKey: "sk-test", model: "o3-mini")
+        _ = try await llmClient.chatCompletion(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: config,
+            options: ChatCompletionOptions(temperature: 0.7, maxTokens: 500)
+        )
+
+        // Reasoning models must use max_completion_tokens, not max_tokens
+        XCTAssertNil(capturedBody?["max_tokens"])
+        XCTAssertEqual(capturedBody?["max_completion_tokens"] as? Int, 500)
+        // Reasoning models must not send temperature
+        XCTAssertNil(capturedBody?["temperature"])
+    }
+
+    func testGPT5UsesMaxCompletionTokensButKeepsTemperature() async throws {
+        var capturedBody: [String: Any]?
+
+        MockURLProtocol.handler = { request in
+            if let body = self.extractBody(from: request) {
+                capturedBody = body
+            }
+            return (self.okResponse(for: request), self.validResponseData())
+        }
+
+        let config = LLMProviderConfig.openai(apiKey: "sk-test", model: "gpt-5.2")
+        _ = try await llmClient.chatCompletion(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: config,
+            options: ChatCompletionOptions(temperature: 0.7, maxTokens: 500)
+        )
+
+        // GPT-5.x requires max_completion_tokens, not max_tokens
+        XCTAssertNil(capturedBody?["max_tokens"])
+        XCTAssertEqual(capturedBody?["max_completion_tokens"] as? Int, 500)
+        // But GPT-5.x still accepts temperature (unlike reasoning models)
+        XCTAssertEqual(capturedBody?["temperature"] as? Double, 0.7)
+    }
+
+    func testNonReasoningModelUsesMaxTokens() async throws {
+        var capturedBody: [String: Any]?
+
+        MockURLProtocol.handler = { request in
+            if let body = self.extractBody(from: request) {
+                capturedBody = body
+            }
+            return (self.okResponse(for: request), self.validResponseData())
+        }
+
+        let config = LLMProviderConfig.openai(apiKey: "sk-test", model: "gpt-4o")
+        _ = try await llmClient.chatCompletion(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: config,
+            options: ChatCompletionOptions(temperature: 0.7, maxTokens: 500)
+        )
+
+        XCTAssertEqual(capturedBody?["max_tokens"] as? Int, 500)
+        XCTAssertNil(capturedBody?["max_completion_tokens"])
+        XCTAssertEqual(capturedBody?["temperature"] as? Double, 0.7)
+    }
+
+    func testOpenAICompatibleProviderDoesNotApplyOpenAISpecificTokenParameters() async throws {
+        var capturedBody: [String: Any]?
+
+        MockURLProtocol.handler = { request in
+            if let body = self.extractBody(from: request) {
+                capturedBody = body
+            }
+            return (self.okResponse(for: request), self.validResponseData())
+        }
+
+        let config = LLMProviderConfig.openaiCompatible(
+            apiKey: "sk-test",
+            model: "gpt-5.2",
+            baseURL: URL(string: "https://api.example.com/v1")!
+        )
+        _ = try await llmClient.chatCompletion(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: config,
+            options: ChatCompletionOptions(temperature: 0.7, maxTokens: 500)
+        )
+
+        XCTAssertEqual(capturedBody?["max_tokens"] as? Int, 500)
+        XCTAssertNil(capturedBody?["max_completion_tokens"])
+        XCTAssertEqual(capturedBody?["temperature"] as? Double, 0.7)
+    }
+
+    // MARK: - Ollama Context Window
+
+    func testOllamaRequestIncludesNumCtxAndThinkFalse() async throws {
+        var capturedBody: [String: Any]?
+
+        MockURLProtocol.handler = { request in
+            if let body = self.extractBody(from: request) {
+                capturedBody = body
+            }
+            return (self.okResponse(for: request), self.validOllamaResponseData())
+        }
+
+        let config = LLMProviderConfig.ollama(model: "qwen3.5:4b")
+        _ = try await llmClient.chatCompletion(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: config,
+            options: .default
+        )
+
+        let options = capturedBody?["options"] as? [String: Any]
+        XCTAssertEqual(options?["num_ctx"] as? Int, 8192)
+        XCTAssertEqual(capturedBody?["think"] as? Bool, false)
+    }
+
+    func testNonOllamaRequestOmitsOptions() async throws {
+        var capturedBody: [String: Any]?
+
+        MockURLProtocol.handler = { request in
+            if let body = self.extractBody(from: request) {
+                capturedBody = body
+            }
+            return (self.okResponse(for: request), self.validResponseData())
+        }
+
+        let config = LLMProviderConfig.openai(apiKey: "sk-test")
+        _ = try await llmClient.chatCompletion(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: config,
+            options: .default
+        )
+
+        XCTAssertNil(capturedBody?["options"])
+    }
+
+    func testOllamaListModelsUsesNativeTagsEndpoint() async throws {
+        var capturedRequest: URLRequest?
+
+        MockURLProtocol.handler = { request in
+            capturedRequest = request
+            return (self.okResponse(for: request), Data("""
+            {
+              "models": [
+                {"name":"qwen3.5:4b"},
+                {"name":"gemma3:4b"},
+                {"name":"nomic-embed-text"}
+              ]
+            }
+            """.utf8))
+        }
+
+        let config = LLMProviderConfig.ollama(model: "qwen3.5:4b")
+        let models = try await llmClient.listModels(config: config)
+
+        XCTAssertEqual(capturedRequest?.url?.absoluteString, "http://localhost:11434/api/tags")
+        XCTAssertEqual(capturedRequest?.httpMethod, "GET")
+        XCTAssertEqual(models, ["gemma3:4b", "qwen3.5:4b"])
+    }
+
+    func testOllamaListModelsPreservesBasePathWhenBuildingTagsEndpoint() async throws {
+        var capturedRequest: URLRequest?
+
+        MockURLProtocol.handler = { request in
+            capturedRequest = request
+            return (self.okResponse(for: request), Data("""
+            {"models":[{"name":"local-model"}]}
+            """.utf8))
+        }
+
+        let config = LLMProviderConfig.ollama(
+            model: "local-model",
+            baseURL: URL(string: "http://local-ai.example.test/custom/v1")!
+        )
+        let models = try await llmClient.listModels(config: config)
+
+        XCTAssertEqual(capturedRequest?.url?.absoluteString, "http://local-ai.example.test/custom/api/tags")
+        XCTAssertEqual(models, ["local-model"])
+    }
+
+    func testOllamaListModelsFallsBackToOpenAICompatibleModelsEndpoint() async throws {
+        var capturedURLs: [String] = []
+
+        MockURLProtocol.handler = { request in
+            capturedURLs.append(request.url!.absoluteString)
+            if request.url?.path == "/api/tags" {
+                let response = HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 404,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!
+                return (response, Data())
+            }
+            return (self.okResponse(for: request), Data("""
+            {"data":[{"id":"qwen3.5:4b"}]}
+            """.utf8))
+        }
+
+        let config = LLMProviderConfig.ollama(model: "qwen3.5:4b")
+        let models = try await llmClient.listModels(config: config)
+
+        XCTAssertEqual(
+            capturedURLs,
+            [
+                "http://localhost:11434/api/tags",
+                "http://localhost:11434/v1/models",
+            ]
+        )
+        XCTAssertEqual(models, ["qwen3.5:4b"])
+    }
+
+    func testOpenAIListModelsFiltersCatalogToStreamingChatModels() async throws {
+        MockURLProtocol.handler = { request in
+            XCTAssertEqual(request.url?.absoluteString, "https://api.openai.com/v1/models")
+            return (self.okResponse(for: request), Data("""
+            {
+              "data": [
+                {"id":"gpt-5.5"},
+                {"id":"gpt-5.5-pro"},
+                {"id":"gpt-4.1-mini"},
+                {"id":"gpt-4o-transcribe"},
+                {"id":"gpt-image-1"},
+                {"id":"text-embedding-3-large"},
+                {"id":"omni-moderation-latest"},
+                {"id":"chatgpt-4o-latest"},
+                {"id":"o2-mini"},
+                {"id":"o10-mini"},
+                {"id":"o4-mini"}
+              ]
+            }
+            """.utf8))
+        }
+
+        let models = try await llmClient.listModels(config: .openai(apiKey: "sk-test"))
+
+        XCTAssertEqual(models, ["chatgpt-4o-latest", "gpt-4.1-mini", "gpt-5.5", "o2-mini", "o4-mini"])
+    }
+
+    func testOpenAICompatibleListModelsFiltersObviousNonTextModels() async throws {
+        MockURLProtocol.handler = { request in
+            XCTAssertEqual(request.url?.absoluteString, "https://custom.example.test/v1/models")
+            return (self.okResponse(for: request), Data("""
+            {
+              "data": [
+                {"id":"llama-3.1-8b-instruct"},
+                {"id":"text-embedding-3-large"},
+                {"id":"stable-diffusion-xl"},
+                {"id":"whisper-large-v3"},
+                {"id":"bge-reranker-v2"}
+              ]
+            }
+            """.utf8))
+        }
+
+        let config = LLMProviderConfig.openaiCompatible(
+            model: "llama-3.1-8b-instruct",
+            baseURL: URL(string: "https://custom.example.test/v1")!
+        )
+        let models = try await llmClient.listModels(config: config)
+
+        XCTAssertEqual(models, ["llama-3.1-8b-instruct"])
+    }
+
+    func testGeminiListModelsUsesNativeModelsEndpoint() async throws {
+        var capturedRequest: URLRequest?
+
+        MockURLProtocol.handler = { request in
+            capturedRequest = request
+            return (self.okResponse(for: request), Data("""
+            {
+              "models": [
+                {
+                  "name": "models/text-embedding-004",
+                  "supportedGenerationMethods": ["embedContent"]
+                },
+                {
+                  "name": "models/gemini-3-pro-image-preview",
+                  "supportedGenerationMethods": ["generateContent"]
+                },
+                {
+                  "name": "models/nano-banana-pro-preview",
+                  "supportedGenerationMethods": ["generateContent"]
+                },
+                {
+                  "name": "models/gemini-3.5-flash",
+                  "supportedGenerationMethods": ["generateContent", "countTokens"]
+                }
+              ]
+            }
+            """.utf8))
+        }
+
+        let models = try await llmClient.listModels(config: .gemini(apiKey: "gem-key", model: "gemini-3.5-flash"))
+
+        XCTAssertEqual(capturedRequest?.url?.scheme, "https")
+        XCTAssertEqual(capturedRequest?.url?.host, "generativelanguage.googleapis.com")
+        XCTAssertEqual(capturedRequest?.url?.path, "/v1beta/models")
+        let queryItems = URLComponents(url: try XCTUnwrap(capturedRequest?.url), resolvingAgainstBaseURL: false)?
+            .queryItems?
+            .reduce(into: [String: String]()) { result, item in result[item.name] = item.value }
+        XCTAssertEqual(queryItems?["pageSize"], "1000")
+        XCTAssertEqual(queryItems?["key"], "gem-key")
+        XCTAssertNil(capturedRequest?.value(forHTTPHeaderField: "Authorization"))
+        XCTAssertEqual(models, ["gemini-3.5-flash"])
+    }
+
+    func testGeminiListModelsPreservesCustomBaseURLQueryItems() async throws {
+        var capturedRequest: URLRequest?
+
+        MockURLProtocol.handler = { request in
+            capturedRequest = request
+            return (self.okResponse(for: request), Data("""
+            {"models":[{"name":"models/gemini-3.5-flash","supportedGenerationMethods":["generateContent"]}]}
+            """.utf8))
+        }
+
+        let config = LLMProviderConfig.gemini(
+            apiKey: "gem-key",
+            model: "gemini-3.5-flash",
+            baseURL: URL(string: "https://proxy.example.test/gemini/openai?proxy=1&alt=json")!
+        )
+        let models = try await llmClient.listModels(config: config)
+
+        XCTAssertEqual(capturedRequest?.url?.host, "proxy.example.test")
+        XCTAssertEqual(capturedRequest?.url?.path, "/gemini/models")
+        let queryItems = URLComponents(url: try XCTUnwrap(capturedRequest?.url), resolvingAgainstBaseURL: false)?
+            .queryItems?
+            .reduce(into: [String: String]()) { result, item in result[item.name] = item.value }
+        XCTAssertEqual(queryItems?["proxy"], "1")
+        XCTAssertEqual(queryItems?["alt"], "json")
+        XCTAssertEqual(queryItems?["pageSize"], "1000")
+        XCTAssertEqual(queryItems?["key"], "gem-key")
+        XCTAssertEqual(models, ["gemini-3.5-flash"])
+    }
+
+    func testOpenRouterListModelsRequestsTextOutputAndFiltersModalities() async throws {
+        var capturedRequest: URLRequest?
+
+        MockURLProtocol.handler = { request in
+            capturedRequest = request
+            return (self.okResponse(for: request), Data("""
+            {
+              "data": [
+                {
+                  "id":"openai/gpt-5.5",
+                  "architecture": {
+                    "input_modalities": ["text"],
+                    "output_modalities": ["text"]
+                  }
+                },
+                {
+                  "id":"google/gemini-3-pro-image-preview",
+                  "architecture": {
+                    "input_modalities": ["text"],
+                    "output_modalities": ["image"]
+                  }
+                },
+                {
+                  "id":"openai/text-embedding-3-large",
+                  "architecture": {
+                    "input_modalities": ["text"],
+                    "output_modalities": ["embeddings"]
+                  }
+                },
+                {
+                  "id":"anthropic/claude-sonnet-4.6"
+                }
+              ]
+            }
+            """.utf8))
+        }
+
+        let models = try await llmClient.listModels(config: .openrouter(apiKey: "sk-or-test"))
+
+        XCTAssertEqual(capturedRequest?.url?.path, "/api/v1/models")
+        let queryItems = URLComponents(url: try XCTUnwrap(capturedRequest?.url), resolvingAgainstBaseURL: false)?
+            .queryItems?
+            .reduce(into: [String: String]()) { result, item in result[item.name] = item.value }
+        XCTAssertEqual(queryItems?["output_modalities"], "text")
+        XCTAssertEqual(models, ["anthropic/claude-sonnet-4.6", "openai/gpt-5.5"])
+    }
+
+    func testAnthropicListModelsRequestsLargePageWithNativeHeaders() async throws {
+        var capturedRequest: URLRequest?
+
+        MockURLProtocol.handler = { request in
+            capturedRequest = request
+            return (self.okResponse(for: request), Data("""
+            {
+              "data": [
+                {"id":"claude-sonnet-4-6","type":"model"},
+                {"id":"workspace-audit-log","type":"audit_log"}
+              ]
+            }
+            """.utf8))
+        }
+
+        let models = try await llmClient.listModels(config: .anthropic(apiKey: "sk-ant-test"))
+
+        XCTAssertEqual(capturedRequest?.url?.path, "/v1/models")
+        let queryItems = URLComponents(url: try XCTUnwrap(capturedRequest?.url), resolvingAgainstBaseURL: false)?
+            .queryItems?
+            .reduce(into: [String: String]()) { result, item in result[item.name] = item.value }
+        XCTAssertEqual(queryItems?["limit"], "1000")
+        XCTAssertEqual(capturedRequest?.value(forHTTPHeaderField: "x-api-key"), "sk-ant-test")
+        XCTAssertEqual(capturedRequest?.value(forHTTPHeaderField: "anthropic-version"), "2023-06-01")
+        XCTAssertEqual(models, ["claude-sonnet-4-6"])
+    }
+
+    func testListModelsThrowsUnsupportedProviderErrorWithoutRequest() async {
+        var didRequest = false
+        MockURLProtocol.handler = { request in
+            didRequest = true
+            return (self.okResponse(for: request), Data())
+        }
+
+        do {
+            _ = try await llmClient.listModels(config: .localCLI())
+            XCTFail("Expected LLMError.connectionFailed")
+        } catch let error as LLMError {
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Connection failed: Model listing is not supported for this provider."
+            )
+            XCTAssertFalse(didRequest)
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+    }
+
+    func testListModelsConnectionFailureIncludesUnderlyingError() async {
+        let urlError = URLError(.cannotConnectToHost)
+        MockURLProtocol.handler = { _ in
+            throw urlError
+        }
+
+        do {
+            _ = try await llmClient.listModels(config: .lmstudio(model: "local-model"))
+            XCTFail("Expected LLMError.connectionFailed")
+        } catch let error as LLMError {
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Connection failed: \(urlError.localizedDescription)"
+            )
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+    }
+
+    // MARK: - Gemini Error Array Format
+
+    func testGeminiErrorArrayParsedCorrectly() async {
+        MockURLProtocol.handler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil
+            )!
+            let json = """
+            [{"error":{"code":404,"message":"models/fake-model is not found","status":"NOT_FOUND"}}]
+            """
+            return (response, Data(json.utf8))
+        }
+
+        let config = LLMProviderConfig.gemini(apiKey: "test-key", model: "fake-model")
+        do {
+            _ = try await llmClient.chatCompletion(
+                messages: [ChatMessage(role: .user, content: "Hi")],
+                config: config,
+                options: .default
+            )
+            XCTFail("Expected LLMError.modelNotFound")
+        } catch let error as LLMError {
+            if case .modelNotFound(let msg) = error {
+                XCTAssert(msg.contains("fake-model"), "Error should mention model name")
+            } else {
+                XCTFail("Expected modelNotFound, got \(error)")
+            }
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+    }
+
+    // MARK: - Stream Error Detection
+
+    func testParseSSELineDetectsOllamaStreamError() {
+        let result = llmClient.parseSSELine("data: {\"error\":\"out of memory\"}")
+        if case .error(let msg) = result {
+            XCTAssertEqual(msg, "out of memory")
+        } else {
+            XCTFail("Expected .error, got \(result)")
+        }
+    }
+
+    func testChatCompletionStreamThrowsWhenDoneArrivesWithoutContent() async throws {
+        MockURLProtocol.handler = { request in
+            (self.okResponse(for: request), Data("data: [DONE]\n\n".utf8))
+        }
+
+        let stream = llmClient.chatCompletionStream(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: .openai(apiKey: "sk-test"),
+            options: .default
+        )
+
+        do {
+            for try await _ in stream {}
+            XCTFail("Expected empty stream to throw")
+        } catch let error as LLMError {
+            guard case .streamingError(let detail) = error else {
+                XCTFail("Expected streamingError, got \(error)")
+                return
+            }
+            XCTAssertTrue(detail.contains("no content"))
+        }
+    }
+
+    func testChatCompletionStreamMapsLMStudioContextStreamError() async throws {
+        MockURLProtocol.handler = { request in
+            let body = """
+            event: error
+            data: {"error":{"message":"The number of tokens to keep from the initial prompt is greater than the context length."},"message":"The number of tokens to keep from the initial prompt is greater than the context length."}
+
+            """
+            return (self.okResponse(for: request), Data(body.utf8))
+        }
+
+        let stream = llmClient.chatCompletionStream(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: .lmstudio(model: "qwen/qwen3-4b-2507"),
+            options: .default
+        )
+
+        do {
+            for try await _ in stream {}
+            XCTFail("Expected LM Studio context stream error")
+        } catch let error as LLMError {
+            guard case .contextTooLong = error else {
+                XCTFail("Expected contextTooLong, got \(error)")
+                return
+            }
+        }
+    }
+
+    func testChatCompletionStreamScrubsStreamErrorMessage() async throws {
+        MockURLProtocol.handler = { request in
+            let body = "data: {\"error\":\"backend leaked sk-1234567890abcdef\"}\n\n"
+            return (self.okResponse(for: request), Data(body.utf8))
+        }
+
+        let stream = llmClient.chatCompletionStream(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: .openai(apiKey: "sk-test"),
+            options: .default
+        )
+
+        do {
+            for try await _ in stream {}
+            XCTFail("Expected stream error")
+        } catch let error as LLMError {
+            guard case .streamingError(let detail) = error else {
+                XCTFail("Expected streamingError, got \(error)")
+                return
+            }
+            XCTAssertFalse(detail.contains("sk-1234567890abcdef"))
+            XCTAssertTrue(detail.contains("<api-key>"))
+        }
+    }
+
+    // MARK: - Local Provider Timeouts
+
+    func testLocalProviderUsesLongerTimeout() async throws {
+        var capturedRequest: URLRequest?
+
+        MockURLProtocol.handler = { request in
+            capturedRequest = request
+            return (self.okResponse(for: request), self.validOllamaResponseData())
+        }
+
+        let config = LLMProviderConfig.ollama(model: "qwen3.5:4b")
+        _ = try await llmClient.chatCompletion(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: config,
+            options: .default
+        )
+
+        XCTAssertEqual(capturedRequest?.timeoutInterval, 300)
+    }
+
+    func testCloudProviderUsesStandardTimeout() async throws {
+        var capturedRequest: URLRequest?
+
+        MockURLProtocol.handler = { request in
+            capturedRequest = request
+            return (self.okResponse(for: request), self.validResponseData())
+        }
+
+        let config = LLMProviderConfig.openai(apiKey: "sk-test")
+        _ = try await llmClient.chatCompletion(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: config,
+            options: .default
+        )
+
+        XCTAssertEqual(capturedRequest?.timeoutInterval, 30)
+    }
+
+    func testOpenAICompatibleLoopbackProviderUsesLongerTimeout() async throws {
+        var capturedRequest: URLRequest?
+
+        MockURLProtocol.handler = { request in
+            capturedRequest = request
+            return (self.okResponse(for: request), self.validResponseData())
+        }
+
+        let config = LLMProviderConfig.openaiCompatible(
+            model: "local-model",
+            baseURL: URL(string: "http://127.0.0.1:8000/v1")!
+        )
+        _ = try await llmClient.chatCompletion(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: config,
+            options: .default
+        )
+
+        XCTAssertEqual(capturedRequest?.timeoutInterval, 300)
+    }
+
+    // MARK: - Helpers
+
+    private func okResponse(for request: URLRequest) -> HTTPURLResponse {
+        HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+    }
+
+    private func validResponseData() -> Data {
+        Data("""
+        {"model":"gpt-4o","choices":[{"message":{"content":"OK"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}
+        """.utf8)
+    }
+
+    private func validAnthropicResponseData() -> Data {
+        Data("""
+        {"model":"claude-sonnet-4-6","content":[{"type":"text","text":"Hello!"}],"usage":{"input_tokens":10,"output_tokens":5},"stop_reason":"end_turn"}
+        """.utf8)
+    }
+
+    private func validOllamaResponseData() -> Data {
+        Data("""
+        {"model":"qwen3.5:4b","message":{"role":"assistant","content":"OK"},"done":true,"done_reason":"stop","prompt_eval_count":5,"eval_count":1}
+        """.utf8)
+    }
+
+    // MARK: - scrubAPIKeyArtifacts
+
+    func testScrubReplacesOpenAIStyleKeys() {
+        let scrubbed = LLMClient.scrubAPIKeyArtifacts(
+            from: "Authentication failed: token sk-abc123def456ghi789 is invalid"
+        )
+        XCTAssertFalse(scrubbed.contains("sk-abc123def456ghi789"))
+        XCTAssertTrue(scrubbed.contains("<api-key>"))
+    }
+
+    func testScrubReplacesAnthropicStyleKeys() {
+        // sk-ant- prefix is a sub-pattern of the generic sk-... rule.
+        let scrubbed = LLMClient.scrubAPIKeyArtifacts(
+            from: "401 Unauthorized: invalid sk-ant-abcdef0123456789"
+        )
+        XCTAssertFalse(scrubbed.contains("sk-ant-abcdef0123456789"))
+        XCTAssertTrue(scrubbed.contains("<api-key>"))
+    }
+
+    func testScrubReplacesBearerTokens() {
+        let scrubbed = LLMClient.scrubAPIKeyArtifacts(
+            from: "Forwarded request: 'Authorization: Bearer eyJhbGciOiJSUzI1NiIs.example'"
+        )
+        XCTAssertFalse(scrubbed.contains("eyJhbGciOiJSUzI1NiIs.example"))
+        XCTAssertTrue(scrubbed.contains("Bearer <token>"))
+    }
+
+    func testScrubReplacesXApiKeyHeader() {
+        let scrubbed = LLMClient.scrubAPIKeyArtifacts(
+            from: "Headers: x-api-key: sk-secret123456abcdef"
+        )
+        // The Bearer-style header echo and the sk- pattern can both fire,
+        // depending on order. We only assert the secret bytes are gone.
+        XCTAssertFalse(scrubbed.contains("sk-secret123456abcdef"))
+    }
+
+    func testScrubReplacesQueryParamKeys() {
+        let scrubbed = LLMClient.scrubAPIKeyArtifacts(
+            from: "Bad URL: ?api_key=somethinglongenough12345"
+        )
+        XCTAssertFalse(scrubbed.contains("somethinglongenough12345"))
+    }
+
+    func testScrubLeavesPlainErrorAlone() {
+        let original = "Rate limit exceeded. Try again in 30 seconds."
+        XCTAssertEqual(LLMClient.scrubAPIKeyArtifacts(from: original), original)
+    }
+
+    func testScrubReplacesURLEncodedBearerTokens() {
+        // AUDIT-076: URL-encoded echoes (`%2B`, `%3D`, ...) must not escape
+        // the Bearer pattern.
+        let scrubbed = LLMClient.scrubAPIKeyArtifacts(
+            from: "Forwarded: 'Authorization: Bearer abc123%2Bdef%3D456ghi789'"
+        )
+        XCTAssertFalse(scrubbed.contains("abc123%2Bdef%3D456ghi789"))
+        XCTAssertTrue(scrubbed.contains("Bearer <token>"))
+    }
+
+    func testScrubReplacesRawBase64BearerTokens() {
+        // PR #477 review: raw Base64 tokens contain `+`, `/`, `=`. A short
+        // pre-`+` prefix must not dodge the length floor, and no suffix may
+        // leak past the first special character.
+        let scrubbed = LLMClient.scrubAPIKeyArtifacts(
+            from: "Forwarded: 'Authorization: Bearer ab+cdef/g=hijklmnop'"
+        )
+        XCTAssertFalse(scrubbed.contains("ab+cdef/g=hijklmnop"))
+        XCTAssertTrue(scrubbed.contains("Bearer <token>"))
+    }
+
+    func testScrubReplacesRawBase64KeyParams() {
+        let scrubbed = LLMClient.scrubAPIKeyArtifacts(
+            from: "Bad URL: ?key=AAAbbbCCC+ddd/EE==&retry=1"
+        )
+        XCTAssertFalse(scrubbed.contains("AAAbbbCCC+ddd/EE=="))
+        XCTAssertTrue(scrubbed.contains("key=<token>"))
+        XCTAssertTrue(scrubbed.contains("&retry=1"), "scrub must stop at the next query separator")
+    }
+
+    func testScrubReplacesSixteenCharGenericKeyParams() {
+        // AUDIT-076: the old 20-char floor let shorter real keys through.
+        let scrubbed = LLMClient.scrubAPIKeyArtifacts(
+            from: "Bad URL: ?key=AIzaSyD4x8Q2hP0a"
+        )
+        XCTAssertFalse(scrubbed.contains("AIzaSyD4x8Q2hP0a"))
+        XCTAssertTrue(scrubbed.contains("key=<token>"))
+    }
+
+    func testScrubLeavesInnocentShortKeyParamsAlone() {
+        // Conservative floor: ordinary `key=<word>` params stay readable.
+        let original = "Lookup failed for key=transcription."
+        XCTAssertEqual(LLMClient.scrubAPIKeyArtifacts(from: original), original)
+    }
+
+    func testScrubIsIdempotent() {
+        let once = LLMClient.scrubAPIKeyArtifacts(from: "key: sk-abcdefghij1234567890")
+        let twice = LLMClient.scrubAPIKeyArtifacts(from: once)
+        XCTAssertEqual(once, twice)
+    }
+
+    private func extractBody(from request: URLRequest) -> [String: Any]? {
+        var bodyData: Data?
+        if let body = request.httpBody {
+            bodyData = body
+        } else if let stream = request.httpBodyStream {
+            stream.open()
+            var buffer = [UInt8](repeating: 0, count: 65536)
+            var collected = Data()
+            while stream.hasBytesAvailable {
+                let count = stream.read(&buffer, maxLength: buffer.count)
+                if count > 0 { collected.append(buffer, count: count) }
+                else { break }
+            }
+            stream.close()
+            bodyData = collected
+        }
+        guard let data = bodyData else { return nil }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    }
+}

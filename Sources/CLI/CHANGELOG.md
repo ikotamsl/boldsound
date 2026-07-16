@@ -1,0 +1,988 @@
+# Changelog -- macparakeet-cli
+
+All notable changes to the **`macparakeet-cli` surface** are documented here.
+
+This file tracks the CLI specifically -- the commands, flags, output schemas,
+and exit codes that scripted callers (shell scripts, CI pipelines, AI agents)
+depend on. App-level changes ship through Sparkle and are documented in the
+appcast at <https://macparakeet.com/appcast.xml>.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com), and the
+CLI adheres to [Semantic Versioning](https://semver.org).
+
+## Compatibility policy
+
+The CLI surface is a public contract. We follow semver:
+
+- **MAJOR** -- any change that breaks scripted callers: removed commands,
+  renamed flags, removed JSON fields, changed exit-code meanings, changed
+  default behavior of an existing flag.
+- **MINOR** -- additive changes: new commands, new flags, new optional JSON
+  fields, new exit codes for new error classes.
+- **PATCH** -- bug fixes, output formatting tweaks that preserve schema,
+  documentation, performance work.
+
+When we deprecate a command or flag, the old name keeps working for **at least
+one minor release** with a clear `--help` notice and a CHANGELOG callout. New
+names are added first; old names are removed only at a MAJOR boundary.
+
+JSON output schemas are part of the contract: top-level shape (array vs
+object), field names, and field types are stable within a major version. We
+may add new optional fields in a minor release.
+
+### Exit codes
+
+The CLI uses a small set of exit codes. They are part of the public contract;
+new error classes get new minor-version codes, never silent reuse.
+
+| Code | Meaning |
+|------|---------|
+| `0`  | Success. |
+| `1`  | Runtime failure -- the command attempted its work and the work failed. Examples: LLM provider call returned an error, transcription failed, database read/write error, network unreachable. The command writes a one-line stderr message describing the failure. |
+| `2`  | Validation/misuse -- the invocation itself was malformed before the command did any real work. Examples: unknown provider, missing required flag, malformed input file, unsupported `--format` value. ArgumentParser produces this for unknown flags as well. |
+| `130` | Interrupted by `SIGINT` (Ctrl-C). Inherits Unix convention; downstream agents should treat this as cancellation, not failure. |
+
+After argument parsing succeeds, `--json` output never goes to stderr
+regardless of exit code. When `--json` is passed, both success and post-parse
+failure print a JSON object to stdout; the exit code remains the source of
+truth for branching.
+
+The canonical automation contract for stdout/stderr, envelopes, exit codes,
+and `spec --json` lives in `spec/contracts/cli-json-v1.md`.
+
+### `--json` failure envelope
+
+Any command that accepts `--json` emits this envelope on stdout when the
+command fails *after argument parsing succeeds* — provider error, missing
+input, lookup miss, runtime exception, etc.:
+
+```json
+{
+  "ok": false,
+  "error": "human-readable message",
+  "errorType": "auth",
+  "fix": "optional actionable hint",
+  "meta": {
+    "schemaVersion": 1,
+    "generatedAt": "2026-06-13T00:00:00Z",
+    "warnings": []
+  }
+}
+```
+
+`errorType` is a low-cardinality stable string. Current values: `auth`,
+`config`, `connection`, `context`, `input_empty`, `input_missing`,
+`import_schema`, `invalid_response`, `lookup`, `model`, `provider`,
+`rate_limit`, `runtime`, `streaming`, `truncated`, `validation`. New error
+classes get new values in minor releases; existing values are stable within a
+major.
+
+Stderr stays plain text for human-only progress / status (e.g. "Saved
+PromptResult abc12345"), so piping `--json` stdout through `jq` is safe.
+
+**Parse-time / `validate()` failures** (unknown flags, missing required
+flags, mutually-exclusive flag combinations like `--json` with `--stream`)
+happen before the command starts running and surface through
+ArgumentParser's plain-text stderr path with exit code `2`. Downstream
+agents that branch on `errorType` should also handle the parse-error case
+by checking exit code first: `2` = misuse, `1` = runtime, `0` = success.
+
+## [Unreleased]
+
+### Fixed
+
+- Transcription and retranscription progress now reports
+  `Preparing speech model...` while the local engine loads instead of printing
+  a synthetic 0% update before measurable work begins. JSON stdout is unchanged.
+
+## [3.0.0] — 2026-07-14
+
+### Changed
+
+- Inline Anthropic and OpenRouter LLM commands now default to Claude Sonnet 5.
+
+### Removed
+
+- **Breaking:** removed the `prefer-built-in-mic-bluetooth-output` configuration
+  key because capture no longer rewrites microphone routing based on the audio
+  output device. Existing stored values are ignored. This breaking removal is
+  the reason for the 3.0.0 major release.
+
+### Fixed
+
+- Native Anthropic LLM calls omit `temperature` for newer and unknown Claude
+  models, preventing HTTP 400 responses from models that reject non-default
+  sampling parameters. Known compatible legacy models retain the caller's
+  temperature. The `--model` help example now references Claude Sonnet 5.
+- Cohere Transcribe CLI paths now enforce the same 16 GB memory floor recorded
+  in the speech-engine capability registry. `config set speech-engine cohere`,
+  `models download cohere-transcribe`, `models select cohere-transcribe`, and
+  explicit Cohere transcription/retranscription fail through the existing
+  validation-error path on unsupported Macs; `--engine app-default` falls back
+  to Parakeet with a stderr warning when a stale saved Cohere default cannot
+  run on the current machine.
+
+## [2.14.0] — 2026-07-11
+
+### Added
+
+- `cards list [--since --until --source --limit] [--json|--ndjson]` exposes
+  compact per-recording knowledge cards with provenance and deterministic
+  title/date/duration/source/attendee joins. Nullable public fields are emitted
+  explicitly as `null`; date-only bounds follow the existing local-day search
+  convention and compose with source filters.
+- `cards generate [--all|--stale|<id>] [--json]` backfills cards through the
+  configured LLM provider, reports progress on stderr, preserves JSON stdout,
+  aggregates provider token usage, exits `1` when any selected recording fails,
+  and leaves `estimatedCostUSD: null` because the provider layer does not
+  maintain a trustworthy live price table.
+- CLI version `2.14.0` adds the cards command family without changing existing
+  command output shapes.
+- Card listing suppresses stale provenance, `cards generate --stale` reports
+  only its prefiltered stale/missing subset as selected, and card backfill
+  rebuilds the synopsis/topic FTS index for integrity recovery.
+- Regenerated meeting artifact manifests and Markdown now populate
+  `rawMicrophoneAudioPath` and `rawSystemAudioPath` for retained meeting folders
+  that still use the legacy `microphone.m4a` and `system.m4a` raw-audio
+  filenames.
+
+## [2.13.0] -- 2026-07-10
+
+### Added
+
+- New top-level `search <query>` searches normalized meeting and file/URL
+  transcript segments with FTS5 `bm25` ranking and recency tie-breaking. It
+  supports date/source/speaker filters, JSON envelopes, quoted phrases, prefix
+  terms, and `AND`/`OR`. Han/Kana/Thai queries automatically use an unranked
+  substring fallback.
+- `search-reindex` deterministically rebuilds the derived segment table and
+  external-content FTS index from canonical saved transcription JSON/text.
+- New top-level `transcript <id>` reads indexed segment slices for meetings and
+  file/URL captures with `--around`/`--window` or
+  `--around-seq`/`--context`, plus JSON and envelope output.
+
+### Changed
+
+- `search --since/--until` now interprets bare `yyyy-MM-dd` values as local
+  calendar days: `--since` uses local start of day and `--until` includes the
+  full local day. Explicit ISO-8601 offsets and `Z` remain unchanged.
+- New file and URL transcriptions now persist durable `transcriptSegments`
+  alongside word timestamps. Retranscription replaces the affected recording's
+  normalized segments so search results cannot retain the previous transcript.
+
+## [2.12.0] -- 2026-07-06
+
+### Added
+
+- `health --json` now reports `database.status: "schema_skew"` with a clear
+  upgrade message when the shared SQLite database contains migration
+  identifiers unknown to this CLI build. This turns stale-CLI/newer-app
+  database skew into an actionable `macparakeet-cli` upgrade prompt instead of
+  a generic GRDB decode/read error.
+- Destructive local mutators now support `--json` success output: `history
+  delete-dictation`, `history delete-transcription`, `history
+  delete-meeting-audio`, `history clear-meeting-audio`, `models delete`,
+  `models clear`, `vocab words delete`, and `vocab snippets delete`. The new
+  payloads report affected record/model IDs and/or counts while preserving the
+  existing human-readable output when `--json` is omitted. `models clear` now
+  surfaces a whisper-cache removal failure through the standard failure
+  envelope (exit `1`) instead of reporting unconditional success.
+- `spec --json` now documents the registered `feedback` command and the new
+  JSON modes for the destructive mutators above.
+- `config get|set|list` now includes `meeting-speaker-detection`, the saved
+  app-default speaker-detection setting used for meeting recording and meeting
+  retranscription.
+- `meetings artifact <meeting> --json|--envelope` now materializes a
+  deterministic top-level `meeting.md` alongside the existing
+  `manifest.json`, `transcript.json`, notes, and prompt-result files. The
+  returned `MeetingArtifactSnapshot` includes additive `markdownPath` and
+  optional `rawMicrophoneAudioPath`, `cleanedMicrophoneAudioPath`,
+  `rawSystemAudioPath`, and `playbackAudioPath` fields.
+- `meetings show --json` and `meetings export --stdout --format json` now
+  include additive `artifactMarkdownPath` and optional
+  `rawMicrophoneAudioPath`, `cleanedMicrophoneAudioPath`,
+  `rawSystemAudioPath`, and `playbackAudioPath` fields for meeting rows with
+  resolvable artifact folders.
+- `meetings show --json` and `meetings export --stdout --format json` now
+  include an optional local-only `calendarEventSnapshot` for meeting recordings
+  started from a calendar event or probably overlapping the current calendar
+  poll cache. The snapshot can include attendee/organizer names and emails;
+  these fields remain local user data and are not telemetry.
+- Added `retranscribe <record> --update` to rerun STT against retained source
+  audio for an existing saved dictation, transcription, or meeting in place.
+  Records resolve by UUID/prefix, with exact transcription/meeting title
+  lookup where unambiguous; `--kind dictation|transcription|meeting` constrains
+  resolution. The command supports the same speech-engine, model, language,
+  processing-mode, and transcription/meeting speaker-detection overrides as
+  `transcribe` where applicable, and emits either `--json` or `--envelope`
+  machine-readable output.
+- `meetings show --json` and `meetings transcript --format json` now include
+  additive `transcriptSegments` for meetings finalized with durable segments.
+  Each segment carries a UUID, start/end time, speaker/source label, text, and
+  a word-index range into `wordTimestamps`, so agents can cite stable meeting
+  transcript segments without deriving boundaries themselves.
+- `meetings show --json` and meeting JSON exports now include optional
+  `startContext` for rows recorded by versions that capture the local meeting
+  start snapshot. The field reports the trigger kind, configured source mode,
+  and frontmost app bundle id/name captured at recording start.
+
+### Changed
+
+- In DEBUG builds with `MACPARAKEET_DEBUG_APP_STATE_DIR` set, FluidAudio
+  speech/speaker models now resolve under that throwaway state root, and
+  `models clear` removes only that root instead of FluidAudio's global cache.
+  Destructive model commands (`models delete`, `models clear`) therefore no
+  longer touch the real user cache during scoped test runs. Release builds and
+  runs without the override are unchanged.
+- Meeting artifact audio filenames are now role-explicit: `microphone.m4a` →
+  `microphone-raw.m4a`, `system.m4a` → `system-raw.m4a`, and `meeting.m4a` →
+  `meeting-playback.m4a`. Paths surfaced through `MeetingArtifactSnapshot` and
+  meeting JSON output (`rawMicrophoneAudioPath`, `cleanedMicrophoneAudioPath`,
+  `rawSystemAudioPath`, `playbackAudioPath`, and `filePath` for playback) use
+  the new names for newly captured recordings. Archive loading, retranscription,
+  recovery, and cleanup continue to read the old filenames for recordings
+  created by earlier releases.
+- `retranscribe --kind meeting --speaker-detection app-default` now follows
+  the saved meeting speaker-detection preference. `transcribe` and
+  transcription retranscription continue to follow the saved file/URL
+  `speaker-detection` preference; explicit `--speaker-detection on|off`
+  remains a per-run override.
+- `transcribe` / `retranscribe` now apply local recognition-time custom
+  vocabulary boosting when the selected engine is Parakeet TDT (`v3` or `v2`)
+  and enabled `vocab words` entries have no replacement text. Unsupported
+  engines and empty vocabularies keep the previous unboosted path.
+- Human-readable `vocab words list` output now reports whether the current
+  app-default engine supports recognition-time vocabulary boosting. `--json`
+  output is unchanged.
+- `meetings export --format md --stdout` now uses the same shared Markdown
+  renderer as `meeting.md`, including YAML frontmatter, notes, transcript,
+  prompt-result index, artifact paths, and `speakerLabelsIncluded` metadata.
+- `spec --json` now documents `meetings export` JSON stdout mode as
+  `--stdout --format json`, matching the command's file-output default.
+- `transcribe` and transcription `retranscribe` app-default speaker detection
+  now resolve to `on` for a fresh file/URL preference store. `config get
+  speaker-detection` reports `on` when unset; meeting retranscription uses the
+  new `meeting-speaker-detection` app-default value. An explicit saved `off`,
+  `--speaker-detection off`, or `--no-diarize` still disables diarization for
+  the relevant workflow.
+- Plain-text `retranscribe` validation/misuse failures now use exit code `2`,
+  matching the JSON envelope path and the public exit-code contract.
+
+### Fixed
+
+- `vocab snippets delete <id>` now enforces the documented minimum
+  four-character UUID prefix, matching `vocab words delete` and the CLI lookup
+  contract. One-character snippet delete prefixes were a legacy loophole, not a
+  documented surface.
+- `transcribe --format json` now shields native STT diagnostics emitted
+  directly to stdout during inference and teardown, then restores stdout before
+  printing the payload. This keeps CoreML/E5RT runtime warnings from corrupting
+  JSON pipelines.
+
+## [2.11.0] -- 2026-06-28
+
+### Added
+
+- `transcribe --engine` now accepts `cohere` as an explicit on-device Cohere
+  Transcribe selection. `--language` is used as Cohere's required language hint
+  when provided; otherwise the saved Cohere language preference is used.
+- `config get|set|list` now includes `cohere-language`, the saved language used
+  by explicit `--engine cohere` and app-default Cohere transcription when
+  `--language` is omitted.
+- `models list`/`select`/`download`/`delete`/`status` include Cohere Transcribe
+  model availability alongside Parakeet, Nemotron, and Whisper.
+- Cohere transcription now fails fast when the local Cohere model is missing;
+  use `models download cohere-transcribe` for the explicit ~2.1 GB download.
+- `transcribe --format` now accepts `srt` and `vtt` in addition to `text`,
+  `transcript`, and `json`. Both emit timed subtitles through the same renderer
+  as `export --format srt|vtt`, so output is byte-identical between the two
+  paths. This lets `transcribe clip.mp3 --format vtt --output-dir .` write
+  `clip.vtt` in a single step instead of `transcribe` then `export <id>`. A
+  single input without `--output-dir` prints the subtitle to stdout (redirect
+  with `> clip.vtt`); multiple inputs or `--output-dir` write one file each.
+- `transcribe` now prints a short stderr hint after a saved single-input run
+  (text/transcript output), naming the new library record id and the `export`
+  command to turn it into a file. Suppressed for `--no-history`,
+  `--format json|srt|vtt`, and batch runs. stdout is unchanged.
+- `config get|set|list` now includes `auto-meeting-titles`, the shared
+  on/off preference for LLM-generated meeting recording titles.
+- `config get|set|list` now includes `meeting-audio-retention`:
+  `keep-forever`, `delete-after-<1-365>-days`, `<1-365>d`, or
+  `delete-immediately`.
+  The older `save-meeting-audio` key remains supported as a legacy alias:
+  `on` maps to `keep-forever`, and `off` maps to `delete-immediately`.
+- `config get|set|list` now includes `meeting-audio-source`:
+  `microphone-and-system` (default), `microphone-only`, or `system-only`.
+- `config get|set|list` now includes
+  `prefer-built-in-mic-bluetooth-output`, `voice-return-enabled`, and
+  `voice-return-triggers`, so support scripts can reproduce Bluetooth headset
+  routing and Voice Return settings without opening the GUI.
+- `prompts set --source file|youtube|podcast|meeting` scopes `--auto-run` /
+  `--no-auto-run` to one transcription source, matching the app's
+  source-scoped auto-run controls.
+- `transforms restore-defaults` can re-show hidden built-in Transforms, re-seed
+  deleted built-ins, or reset one built-in with `--transform <id-or-name>`.
+- `vocab words set <id> --enabled|--disabled` and
+  `vocab snippets edit <id> --enabled|--disabled` expose the same vocabulary
+  enablement controls shown in the app. Both support `--json` success output.
+
+### Changed
+
+- `transcribe --parakeet-model unified` and `retranscribe --parakeet-model
+  unified` now use Parakeet Unified's native 2080ms streaming export for final
+  transcription, so Unified results include word timestamps for JSON output,
+  exports, and speaker alignment. `models download parakeet-unified` prepares
+  the same timestamp-capable export instead of the older offline batch export.
+- `models delete cohere-transcribe` now removes an incomplete Cohere cache
+  directory as well as a fully downloaded model, so cancelled or failed
+  downloads can be cleaned up from the CLI.
+- `history clear-meeting-audio` now refuses to run while **any** meeting
+  recording lock file is present, including dead-owner sessions still
+  `.awaitingTranscription` in the background queue or pending crash recovery.
+  Previously it only refused while a recording's owning process was still
+  alive. This protects captured audio that has not yet been finalized into a
+  transcript (back-to-back meeting recording stops the recorder while final
+  transcription runs in the background). Stop, finish, or discard the pending
+  recording before clearing.
+- `history clear-meeting-audio` now removes retained meeting audio files while
+  preserving meeting artifact folders (`manifest.json`, `transcript.json`,
+  `notes.md`, and prompt-result files) and their discoverability from saved
+  meeting JSON output. `meetings list/show/artifact` continue to report the
+  artifact folder path after `filePath` has been cleared by audio deletion or
+  retention.
+- `prompts restore-defaults` continues to re-show hidden built-in Transforms
+  during the 2.x compatibility window. Use `transforms restore-defaults` for the
+  newer Transform-specific restore/reset surface.
+- `meeting-vad-sim` is now hidden from `--help`. It is an internal Phase-0
+  diagnostic that was never part of the `spec --json` agent surface; hiding it
+  aligns the human command listing with the machine catalog. The command still
+  runs when invoked by name.
+
+### Fixed
+
+- `prompts add --from-file <path>` and `transforms create --from-file <path>`
+  now expand a leading `~` in the path, matching `quick-prompts add --from-file`.
+  Previously `~/notes/prompt.md` failed with a "no such file" error.
+- `vocab words delete <id>` now applies the same trimming and minimum
+  4-character prefix guard as `vocab words set`. An empty or too-short id is
+  rejected with a validation error (exit `2`) instead of falling through to a
+  bare-prefix match that could delete the only word in the list.
+
+## [2.10.0] -- 2026-06-17
+
+### Added
+
+- New Parakeet model id **`parakeet-unified`** (NVIDIA Parakeet Unified EN
+  0.6B — English-only, ~565 MB int8). It is a selectable Parakeet build
+  alongside `parakeet-v3`/`parakeet-v2`:
+  - `transcribe --parakeet-model unified` transcribes the run with the Unified
+    offline build (strong English offline accuracy with punctuation and
+    capitalization). `app-default`/`v3`/`v2` are unchanged.
+  - `config set parakeet-model unified` persists it as the default Parakeet
+    build (aliases: `english-unified`, `unified-offline`). `config get
+    parakeet-model` returns `unified`.
+  - `models list`/`status` show it; `models download parakeet-unified`,
+    `models select parakeet-unified`, and `models delete parakeet-unified`
+    manage it. Alias spellings (`parakeet:unified`, `parakeet-english-unified`)
+    resolve the same. `models select` requires the model downloaded first.
+  - Additive only — no existing flag, id, or default behavior changes.
+
+## [2.9.0] -- 2026-06-11
+
+### Added
+
+- New Nemotron model id **`nemotron-english-1120ms`** (Nemotron Speech
+  Streaming EN 0.6B — English-only Beta build, ~600 MB). `models list`,
+  `models select`, `models download`, `models delete`, and `models status`
+  understand it alongside `nemotron-multilingual-1120ms`. `models select`
+  sets both `speech-engine=nemotron` and the persisted Nemotron build, and
+  still requires the model to be downloaded first. Alias spellings:
+  `nemotron:english-1120ms`, `nemotron-english`, `nemotron-en`.
+- `transcribe --nemotron-model app-default|multilingual-1120ms|english-1120ms`
+  selects the Nemotron build per run, mirroring `--parakeet-model`.
+  `app-default` follows the saved preference. The English build ignores
+  `--language` (a stderr note is printed when one is passed; stdout/JSON
+  output is unaffected).
+- `config get|set|list` now includes **`nemotron-model`**
+  (`multilingual-1120ms`, default | `english-1120ms`; aliases
+  `multilingual`/`english` accepted). `nemotron-language` applies to the
+  multilingual build only; setting it while the English build is selected
+  still persists the value and prints a stderr note.
+- `meetings artifact <meeting> [--json|--envelope]` materializes the
+  first-class meeting session folder contract and returns a
+  `MeetingArtifactSnapshot`. The folder contains `manifest.json`,
+  `transcript.json`, `notes.md` when notes exist, `prompt-results.json`, and
+  per-result Markdown files under `prompt-results/`. The canonical folder
+  contract lives in `spec/contracts/meeting-artifacts-v1.md`.
+- `config get|set|list` now includes `meeting-artifacts-folder`, which controls
+  the root for future meeting session folders. Use `default` to clear the
+  override and return to Application Support.
+- Safe post-meeting hooks are configurable with `meeting-hook-enabled`,
+  `meeting-hook-path`, and `meeting-hook-timeout`. Hooks are disabled by
+  default, must point at an absolute executable path, receive a JSON
+  `meeting.completed` event on stdin, and write result metadata back to the
+  meeting artifact folder.
+- Meeting JSON commands that matter to agent workflows accept opt-in
+  `--envelope` success output with `{ "ok": true, "command", "data", "meta" }`.
+  Existing `--json` success shapes are unchanged.
+- `history delete-meeting-audio <transcription>` deletes MacParakeet-managed
+  meeting audio for a single saved meeting while keeping the transcript row and
+  clearing its stored audio path.
+- `history clear-meeting-audio` deletes all stored meeting audio and detaches
+  audio paths from saved meeting transcripts. It refuses (exit code `2`) while
+  a meeting recording is in progress in a running app, so it cannot wipe an
+  active session's folder out from under the writer.
+- `config get|set|list` now includes `save-meeting-audio`, matching the GUI's
+  default-on meeting audio retention preference.
+
+### Fixed
+
+- `spec --json` now marks writing commands conservatively (`transcribe`,
+  `meetings export`, and repair-capable `health`) and documents current options
+  that were missing from the machine-readable contract, including
+  `transcribe --mode`, `transcribe --database`, `health --repair-attempts`, and
+  the full `meetings notes` surface.
+
+### Changed
+
+- `--json` failure envelopes may include optional `fix` and `meta` fields. The
+  existing `ok`, `error`, and `errorType` fields are unchanged.
+- The Local CLI provider's default timeout is now **300 seconds** (was 45).
+  Long transcripts routed through CLI agents (`claude -p`, `codex exec`)
+  regularly exceed 45 s, which killed `llm`/`prompts run` generations
+  mid-flight (#478). Stored configs still carrying the old 45 s default are
+  migrated to 300 s once on first load; any value entered after that — 45
+  included — is preserved. Connection tests remain capped at 45 s.
+- `models list` gains one additive row (and `--json` one additive array
+  element) for the new Nemotron build; per-build `selected` markers now
+  reflect the persisted Nemotron build. `models status` /
+  `--json` `nemotronModelVariant` reflects the persisted build and may be
+  `english-1120ms`. Bare `nemotron` ids resolve to the persisted build
+  (previously always multilingual — identical for unchanged configs).
+- `models warm-up`/`models repair` warm the persisted Nemotron build when
+  Nemotron is the active engine; `models status` and `health` report it;
+  `models clear` also removes the English build's `nemotron-streaming`
+  cache root.
+
+## [2.8.0] -- 2026-06-09
+
+### Added
+
+- `transcribe` now accepts **Apple Podcasts** links (e.g.
+  `https://podcasts.apple.com/us/podcast/<slug>/id<id>?i=<episode>`). The
+  episode is resolved through the public iTunes lookup API to its audio
+  enclosure, then downloaded with a native streaming downloader and transcribed
+  through the existing local pipeline. Episode links transcribe that episode;
+  show links transcribe the latest episode. Saved transcripts carry a new
+  `podcast` source type, and `transcribe` telemetry classifies the input as
+  `podcast` (additive — no schema break).
+- `transcribe --podcast "<query>"` runs a **freetext podcast search**: it
+  searches the iTunes podcast directory for the show, parses the show's RSS
+  feed, selects the episode by number/title hints (or the latest when none are
+  given), then fetches and transcribes it. Example:
+  `transcribe --podcast "Lex Fridman episode 400"`. With `--podcast`, positional
+  inputs are ignored; pass `--output-dir` to write a transcript file instead of
+  printing. Ported from the standalone `podcast-transcribe` tool's discovery
+  pipeline.
+- `transcribe --engine` now accepts `nemotron` as an opt-in Beta local ASR
+  engine. `--engine app-default` also follows the saved Nemotron default and
+  Nemotron language hint when the GUI/CLI default is set to Nemotron.
+- `config get|set|list` now includes `nemotron-language`, with `auto`
+  clearing the stored language hint.
+- `models list`, `models select`, `models download`, `models delete`,
+  `models status`, `models warm-up`, `models repair`, and `health
+  --repair-models` understand the Nemotron model id
+  `nemotron-multilingual-1120ms`. `models select` requires the local Nemotron
+  artifact to be downloaded before persisting Nemotron as the shared default.
+
+## [2.7.0] -- 2026-06-06
+
+### Added
+
+- `transcribe` now accepts per-run speaker-count constraints for diarization:
+  `--speaker-count <n>` for an exact known count and `--speaker-min <n>` /
+  `--speaker-max <n>` for a range. These flags imply speaker detection when
+  `--speaker-detection` is left at `app-default`, and they are rejected with
+  `--speaker-detection off` or `--no-diarize`.
+- `transcribe` now accepts any explicit `http://` or `https://` media URL that
+  `yt-dlp` can download, including non-YouTube sites such as Facebook Reels,
+  before passing the downloaded audio/video through the local transcription
+  pipeline.
+- `transcribe --media-audio-quality app-default|m4a|best-available` is the new
+  canonical spelling for downloaded media quality. The older
+  `--youtube-audio-quality` spelling remains accepted as a compatibility alias.
+
+## [2.6.0] -- 2026-05-31
+
+### Added
+
+- `models delete <id>` removes a single downloaded model — one Parakeet build
+  (`parakeet-v2` / `parakeet-v3`) or the Whisper variant (`whisper-*`) — freeing
+  its disk space while leaving every other model in place. Contrast with
+  `models clear`, which still wipes the whole local speech/speaker stack.
+- The active model is protected, and Parakeet's configured build is protected
+  even while Whisper is active: `models delete` refuses it with a validation
+  error (exit `2`) so a delete can't silently force a re-download. Pass
+  `--force` to delete it anyway.
+- Deleting a model that isn't downloaded is a no-op that prints a short note and
+  exits `0`.
+
+## [2.5.0] -- 2026-05-30
+
+### Added
+
+- Parakeet now exposes both model builds: the multilingual `v3` (default) and
+  the English-only `v2`. v2 is a touch faster on English and never mis-detects
+  English speech as another language (the v3 auto-detect failure behind issues
+  #311 and #398).
+- `config set parakeet-model v3|v2` (also `multilingual`/`english` aliases) and
+  `config get parakeet-model` persist the shared GUI/CLI Parakeet build
+  preference. Listed in `config list`.
+- `transcribe --parakeet-model app-default|v3|v2` overrides the Parakeet build
+  for a single run; `app-default` follows the saved preference. Ignored for
+  Whisper.
+- `models list` now lists both Parakeet builds (`parakeet-v3`, `parakeet-v2`)
+  with their per-build install state and approximate size. `models select
+  parakeet-v2` (also `parakeet:v2` / `parakeet-english`) persists the build.
+  `models warm-up` / `repair` / `status` now operate on the selected build
+  instead of always defaulting to v3.
+- `models download parakeet-v2` / `parakeet-v3` (and bare `parakeet` for the
+  selected build) pre-fetches a Parakeet build without selecting it, alongside
+  the existing `whisper-*` download path.
+- `transcribe` now accepts **multiple inputs** and an **`--output-dir`**. Pass
+  several file paths, a folder (recursively expanded to its supported audio/
+  video files), and/or YouTube URLs, or a shell glob like `*.m4a`. With more
+  than one resolved input, or whenever `--output-dir` is set, the command runs
+  in batch mode: it transcribes each input in sequence and writes one transcript
+  per input to the output directory (`<source-name>.txt`, or `.json` for
+  `--format json`), defaulting to the current directory when `--output-dir` is
+  omitted. Existing files are never overwritten (a `-2`, `-3`, … suffix is
+  added).
+- Batch mode is **continue-on-error**: a failed input prints a `✗` line to
+  stderr and is counted; the run proceeds. The process exits non-zero with a
+  one-line summary (`N input(s) failed to transcribe (M succeeded).`) if any
+  input failed, and `0` when all succeed. With `--format json`, a batch run
+  that ends with failures also emits the standard `--json` failure envelope
+  on stdout once the run completes — per-input results still go to the
+  output directory, and stdout is otherwise unused in batch mode (this
+  follows the general failure-envelope rule above; clarified per AUDIT-080).
+
+### Unchanged (back-compat)
+
+- A **single input with no `--output-dir`** behaves exactly as before: the
+  transcript is written to stdout in the chosen `--format`, progress goes to
+  stderr, and the `--json` success/failure envelope contract is preserved. No
+  flags were renamed or removed; this is an additive minor release.
+
+### Changed
+
+- `models list` now returns **two** Parakeet rows (`parakeet-v3`, `parakeet-v2`)
+  instead of one. Callers that assumed a single Parakeet entry, or that read the
+  Parakeet id as the literal `"parakeet"`, should switch to selecting by the
+  `selected` flag / the new ids. The bare `parakeet` id still works in
+  `models select` (keeps the persisted build). JSON field names and types are
+  unchanged.
+- `models list` Parakeet `size` now reports the real ~465 MB per-build download
+  footprint (previously an inaccurate "6 GB" placeholder).
+
+## [2.4.0] -- 2026-05-29
+
+### Added
+
+- `meeting-vad-sim <audio>` (dev tool) replays the meeting live-preview
+  chunking path on an audio file and compares the fixed 5s strategy against VAD
+  speech-boundary chunking (`--mode fixed|vad|both`). Reports chunk boundaries,
+  per-ingest latency, and the realtime factor used to decide whether VAD can run
+  inline in the capture task. `--json`, `--all-chunks`, and `--batch-ms`
+  supported. Headless verification for the VAD-guided live chunking work; does
+  not exercise live capture or the GUI.
+- LLM-backed commands now expose `--allow-insecure-http` for intentional
+  non-loopback `http://` endpoints on non-local providers.
+- `spec --json` prints a machine-readable CLI contract for agents and scripts,
+  including JSON conventions, exit codes, and supported automation commands.
+- `meetings results list|add` exposes saved meeting PromptResults through the
+  CLI. `add` stores externally generated output as a `PromptResult` without
+  invoking an LLM, preserving the meeting transcript as the canonical object.
+- `meetings list --json`, `meetings show --json`, and `meetings export` with
+  `--stdout --format json` now include `hasPromptResults` and
+  `promptResultCount`, and Markdown exports include the same count in metadata,
+  so agents can tell whether structured meeting outputs already exist before
+  fetching result rows.
+- `llm` commands using `--provider lmstudio` now honor optional LM Studio API
+  tokens via `--api-key`, `--api-key-env`, or `LM_API_TOKEN`.
+- `vocab snippets edit <id> --trigger ... --expansion ...` updates an existing
+  text snippet without deleting/recreating it.
+
+### Changed
+
+- CLI telemetry now lives in the root runner instead of the `transcribe`
+  command, so every successfully parsed command emits one privacy-safe
+  `cli_operation` event. `transcribe` keeps its extra coarse input/output
+  metadata; other commands report only command path, outcome, duration, exit
+  code, and error type.
+- `transcribe` now defaults `--speaker-detection` to `app-default`, so bare
+  CLI transcription follows the saved GUI/CLI speaker-detection preference.
+  Use `--speaker-detection on` to force diarization for one run, or
+  `--speaker-detection off` / `--no-diarize` to force it off.
+- CLI LLM base URL validation now matches the GUI safety model: `https://`
+  remains allowed everywhere, `http://` remains allowed for loopback and local
+  providers, and non-local providers require `--allow-insecure-http` before
+  sending prompt content or API keys over cleartext HTTP. When the override is
+  used, the CLI writes a warning to stderr so stdout stays machine-readable.
+  Existing scripts that intentionally target a non-loopback HTTP endpoint can
+  keep that behavior by adding the explicit flag.
+
+## [2.3.1] -- 2026-05-19
+
+### Changed
+
+- Patch release for the standalone Homebrew channel. No command, flag, JSON
+  schema, or exit-code changes from 2.3.0; the release artifact is rebuilt
+  from latest `main` after the STT-language telemetry/data-model update.
+
+## [2.3.0] -- 2026-05-16
+
+### Changed
+
+- `flow` command renamed to `vocab`. All subcommands move:
+  `flow words` → `vocab words`, `flow snippets` → `vocab snippets`,
+  `flow process` → `vocab process`. `flow vocabulary export/import/schema`
+  flattened to `vocab export/import/schema`. The old `flow` command remains as
+  a deprecated alias for this minor release, including the legacy
+  `flow vocabulary export/import/schema` forms, and will be removed at the next
+  major CLI version.
+
+### Added
+
+- `transforms list / show / run / create / delete` — new subcommand tree
+  for managing user-defined Transforms (ADR-022). Same surface that the
+  GUI's Transforms tab edits, headlessly accessible so agent operators
+  can provision a fresh device, run a saved prompt against arbitrary
+  text from CI, and verify the dispatch table without launching the
+  app.
+  - `transforms list [--json]` — lists Transforms with their bound
+    shortcuts in human-readable rows or a JSON array.
+  - `transforms show <id|name> [--json]` — prints the prompt body and
+    the bound shortcut.
+  - `transforms run <id|name> --input FILE|- [--stream] [--json]` —
+    invokes the saved prompt body via the user's configured LLM
+    provider. Distinct from `llm transform --prompt "..."`, which
+    takes an ad-hoc prompt string.
+  - `transforms create --name --prompt|--from-file [--shortcut "opt+1"]
+    [--json]` — headless install of a new Transform.
+    Shortcut format: `opt+1`, `cmd+shift+P`, etc. Refuses bare-key
+    bindings (must include a modifier).
+  - `transforms delete <id|name> [--json]` — deletes a custom
+    Transform. Built-ins are protected.
+  - `transforms list/show/create --json` use a snake-cased `TransformDTO`
+    payload (`id`, `name`, `shortcut`, `is_built_in`,
+    `prompt`, `created_at`, `updated_at`). `transforms run --json`
+    emits the LLM result envelope, and `transforms delete --json` emits
+    `{deleted,id,name}`.
+- `transforms history list / show / delete / clear` — read/manage the
+  local Transform run history that the GUI's Transforms tab also surfaces.
+  Each completed Transform run records input, output, source app, capture
+  and replacement paths, and timing. Local-only; agents can use it to
+  verify what the dispatch table just produced without launching the app.
+  - `transforms history list [--limit N] [--json]` — newest first; default
+    limit 20.
+  - `transforms history show <id-prefix> [--json]` — full input/output for
+    one row. ID prefixes must be at least 4 hex chars; `--json` maps
+    invalid-prefix errors to `errorType: "validation"`, missing-row to
+    `errorType: "lookup"`.
+  - `transforms history delete <id-prefix> [--json]` / `transforms history
+    clear [--json]` — single-row delete and bulk clear. `--json` emits
+    `{ok, id}` / `{ok, deleted_count}` respectively.
+  - JSON payloads use a snake-cased `TransformHistoryDTO`
+    (`id`, `transform_id`, `transform_name`, `input_text`, `output_text`,
+    `source_app_bundle_id`, `source_app_name`, `capture_path`,
+    `replacement_path`, `llm_elapsed_ms`, `total_elapsed_ms`,
+    `created_at`, `updated_at`).
+
+### Fixed
+
+- YouTube transcriptions captured under `--youtube-audio-quality
+  best-available` (or the GUI's "Best available" mode) now play through
+  the in-app audio scrubber. AVFoundation on macOS has no native WebM or
+  Opus decoder, so the saved file used to fail silently on `AVPlayer.play()`
+  while the video panel still worked (it re-extracts a streamable URL via
+  yt-dlp). The transcription pipeline now transcodes the saved audio to
+  `.m4a` (AAC 192k, faststart) in a background task after STT completes,
+  writing through a unique temp path before the atomic commit so the
+  post-STT path and the lazy on-open migration can race safely on the
+  same source. The source webm is removed only after the database update
+  succeeds. Existing webm-backed transcriptions migrate lazily on next
+  open. Recognized unplayable extensions: `webm`, `weba`, `opus`, `ogg`,
+  `mkv`. No CLI flag change — `--youtube-audio-quality best-available`
+  keeps its measured WER advantage (issue #237). Skipped when
+  `--downloaded-audio delete` or the GUI's audio retention is off, since
+  the saved file is being discarded anyway.
+
+### Added
+
+- `transcribe --format transcript` prints only the final transcript text to
+  stdout, with progress/status still isolated on stderr. This keeps the
+  existing human `--format text` view intact while giving shell pipelines a
+  clean `pbcopy`, `grep`, `tee`, or local-LLM input mode.
+- `transcribe --no-history` runs file/URL transcription without saving a
+  completed transcription row to MacParakeet history. For YouTube inputs,
+  downloaded audio is treated as temporary even when the shared app default is
+  to retain transcription audio.
+- `models list` and `models select <id>` provide user-facing aliases over the
+  shared speech-engine defaults. `models list` shows Parakeet plus the
+  configured WhisperKit variant with installed/selected state; `models select`
+  writes the same default that `config set speech-engine` writes, and validates
+  Whisper model availability before switching.
+- `transcribe --engine app-default` resolves the speech engine and Whisper
+  language from the same saved defaults used by the GUI, while preserving
+  Parakeet as the no-flag CLI default.
+- `transcribe --speaker-detection app-default|on|off` lets agents choose
+  GUI-default speaker detection or pin diarization explicitly. The no-flag
+  CLI default remains `on`; `--no-diarize` continues to work as a
+  compatibility alias for `--speaker-detection off`.
+- `config get|set|list` now covers the shared app/CLI transcription defaults
+  agents need for deterministic setup: `processing-mode`, `speech-engine`,
+  `whisper-language`, `speaker-detection`, `save-transcription-audio`, and
+  `youtube-audio-quality`. Config keys accept underscore aliases on input and
+  JSON output uses the canonical hyphenated key names.
+
+## [2.1.0] -- 2026-05-10
+
+### Added
+
+- `transcribe --youtube-audio-quality app-default|m4a|best-available`
+  lets callers choose between the app default, an m4a-first selector for
+  Apple-friendly saved audio files, and yt-dlp's best available source stream,
+  which may save WebM/Opus files.
+
+## [2.0.0] -- 2026-05-03
+
+### Added — `quick-prompts`
+
+- `quick-prompts` manages live meeting Ask tab shortcuts: `list`, `show`,
+  `add`, `set`, `delete`, `pin`, `unpin`, `restore-defaults`, `export`, and
+  `import`.
+- `quick-prompts pin <id|prefix|label>` — pin to the after-response strip.
+  Pinning is unbounded; overflow is handled visually by the strip's
+  horizontal scroll with edge-fade affordance.
+- `quick-prompts unpin <id|prefix|label>` — unpin from the strip.
+- `quick-prompts add --pinned` — create a custom prompt already pinned.
+- Group labels are valid on every prompt; they control empty-state and
+  sparkle-menu grouping only.
+- Hidden quick prompts cannot stay pinned: `set --hidden` auto-unpins a pinned
+  row, and `pin` auto-shows a hidden row.
+- `quick-prompts list --pinned <true|false>` — filter list by pin state.
+- `quick-prompts export --pinned <true|false>` — filter export by pin state.
+- Quick-prompt import/export uses bundle schema **v1**
+  (`macparakeet.quick_prompts/1`) with `isPinned: Bool` per prompt. There is
+  no `kind` bundle schema because this surface has not shipped publicly yet.
+
+### Added
+
+- `import_schema` `errorType` value for malformed quick-prompts import files
+  (e.g. wrong `schema`, unsupported `version`, JSON parse failure).
+- `flow vocabulary export`, `flow vocabulary import`, and `flow vocabulary
+  schema` commands for round-trip backup of the combined vocabulary (custom
+  words + text snippets). `import` supports `--policy skip|replace`,
+  `--dry-run`, `--json`, and stdin (omit `--input`); `export` writes to
+  stdout when `--output` is omitted. `schema` prints an LLM-friendly spec
+  (or `--json` structured form) so a local coding agent can generate valid
+  bundles. Bundle format is versioned (`macparakeet.vocabulary` v1).
+
+### Fixed
+
+- `transcribe --format json` and `export --format json --stdout` now emit the
+  documented JSON failure envelope for post-parse failures.
+
+## [1.4.0] -- 2026-04-28
+
+### Added
+
+- LLM-backed commands now accept `--api-key-env NAME`; hosted providers also
+  read `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, and
+  `OPENROUTER_API_KEY` directly.
+- `config` command namespace for users who only install the CLI (no GUI):
+  `macparakeet-cli config get telemetry`, `config set telemetry on|off`, and
+  `config list`. Values persist in the same UserDefaults suite the GUI reads
+  (`com.macparakeet.MacParakeet`), so a later GUI install picks them up.
+- `transcribe` now honors `DO_NOT_TRACK=1` (industry-standard, also honored
+  by Homebrew, GitLab, VS Code) and auto-disables telemetry in CI environments
+  (`CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, `BUILDKITE`, `CIRCLECI`, `TRAVIS`,
+  `JENKINS_URL`, `TF_BUILD`, `TEAMCITY_VERSION` set to a truthy value). The
+  CI auto-disable can be overridden with `MACPARAKEET_TELEMETRY=1` for
+  developers smoke-testing telemetry from a CI shell. `MACPARAKEET_TELEMETRY=0`
+  remains the explicit per-process kill switch.
+
+### Fixed
+
+- Applied the `--json` failure-envelope contract consistently across read-only
+  CLI surfaces such as history, stats, prompts, calendar, flow vocabulary, and
+  model status.
+- `prompts run --json` now emits a single JSON object even when saving the
+  generated `PromptResult` fails.
+- CLI deletion now removes app-owned dictation audio, YouTube audio, and
+  meeting recording folders before deleting their database rows. If managed
+  audio cleanup fails, deletion fails visibly instead of leaving app-owned
+  audio behind silently.
+- Local transcription and export output paths now expand `~`; export also
+  creates parent directories and sanitizes default file names.
+- App-bundled CLI installs now include a signed `yt-dlp` helper seed. YouTube
+  transcription seeds the managed App Support helper from the bundle before
+  falling back to network install, while `health --json` remains non-mutating
+  and `health --repair-binaries` explicitly fetches the latest helper.
+
+## [1.3.0] -- 2026-04-26
+
+### Added
+
+- `transcribe` accepts `--engine parakeet|whisper` (default `parakeet`) and
+  `--language <code>` for Whisper language hints. The `--engine` flag is
+  per-invocation and does not mutate the GUI's Speech Recognition setting.
+- `transcribe --format json` may include an optional top-level `language`
+  field on successful output when the active engine detects or confirms a
+  language. This is additive; existing fields and defaults are unchanged.
+- `models download <variant>` recognizes Whisper model identifiers such as
+  `whisper-large-v3-v20240930-turbo-632MB` and stores them under MacParakeet's
+  Whisper model cache.
+- `meetings` command namespace for deterministic, local meeting objects:
+  `meetings list`, `meetings show`, `meetings transcript`,
+  `meetings notes get|set|append|clear`, and `meetings export`.
+  These commands expose meeting recordings without requiring any LLM provider:
+  metadata, notes, transcript text, timestamp formats, and Markdown/JSON
+  exports are all local database reads/writes.
+- `transcribe` now initializes the shared telemetry client and emits a
+  privacy-safe `cli_operation` product-health event after execution. This does
+  not change stdout, stderr, JSON schemas, or exit codes; it follows the GUI
+  telemetry preference and the CLI opt-out controls documented above.
+
+### Fixed
+
+- `prompts run` now renders `{{userNotes}}` and `{{transcript}}` with the same
+  prompt assembly path used by the GUI, and stores `userNotesSnapshot` on saved
+  prompt results. This restores GUI/CLI parity for notes-steered meeting
+  prompts while keeping LLM invocation explicitly under `prompts`.
+- Meeting retranscription now preserves durable user-authored meeting notes.
+- `health --json` is now a non-mutating readiness probe for helper binaries:
+  it reports whether `yt-dlp` is installed without downloading or updating it.
+  Use `health --repair-binaries` to explicitly install/update helper binaries.
+- UUID prefix lookup now enforces the documented minimum prefix length of
+  four characters before matching database records by ID prefix.
+
+## [1.2.0] -- 2026-04-26
+
+### Added
+
+- `--json` output mode for the LLM commands (`llm summarize`, `llm chat`,
+  `llm transform`, `prompts run`) and `llm test-connection`. Emits a
+  structured envelope so agents can read `{output, provider, model,
+  usage: {promptTokens, completionTokens, totalTokens}, stopReason,
+  latencyMs}` directly rather than regexing prose. Token field names
+  match the OpenAI convention. `usage` is omitted when the provider
+  doesn't surface it (`localCLI`; some `openaiCompatible` servers).
+  `stopReason` is pass-through — provider-native vocabulary
+  (`end_turn`, `length`, `STOP`, `done_reason`, etc.) is surfaced
+  verbatim. `test-connection --json` returns
+  `{ok: true, provider, model, latencyMs}` on success and the standard
+  `--json` failure envelope (see top of file) on failure. All `--json`
+  commands now share that failure envelope so downstream agents see one
+  of two shapes — never a mix of JSON success and plain-text failure.
+
+### Not yet supported
+
+- `--json` combined with `--stream` is rejected at argument validation
+  with a clear error. NDJSON streaming (`{type: "delta"}` lines
+  followed by a `{type: "final"}` envelope) is a planned follow-up.
+
+## [1.1.0] -- 2026-04-26
+
+### Added
+
+- `flow process --database <path>` can now run the clean text-processing
+  pipeline against an explicit SQLite database, matching the testability and
+  agent-workflow override already used by other `flow` commands.
+
+### Fixed
+
+- `feedback` and direct `llm` commands now write validation and provider
+  errors to stderr instead of stdout.
+- `transcribe --format` now rejects unsupported values during argument parsing
+  instead of silently falling back to text output.
+- `transcribe` now awaits STT runtime shutdown on both success and error paths.
+
+## [1.0.1] -- 2026-04-26
+
+End-to-end validation of the brew-installed 1.0.0 binary surfaced a
+single stdout-pollution bug in `transcribe`. Fixed below; no other
+behavior change.
+
+### Fixed
+
+- `transcribe --format json` emitted a `Transcribing <file>...` (or
+  `Converting`/`Downloading`/`Identifying speakers`/`Finalizing` for
+  YouTube URLs) progress line on **stdout** before the JSON payload,
+  which broke `transcribe ... --format json | jq .` for any scripted
+  caller. Progress messages now go to stderr (matching the existing
+  pattern in `prompts run` and the documented "JSON only to stdout"
+  contract from `integrations/README.md`). New `printErr(_:)` helper
+  in `CLIHelpers.swift` codifies the channel.
+
+### Compatibility notes
+
+- The progress messages are still emitted; they just go to stderr now.
+  Human callers using the human-readable `--format txt` (default) are
+  unaffected — stderr still surfaces in the terminal.
+- Scripted callers that were relying on the progress message appearing
+  on stdout (unlikely; it was a polling-style "..." line) need to read
+  stderr instead.
+
+## [1.0.0] -- 2026-04-25
+
+First release of the CLI as a versioned public surface. The CLI has existed
+since v0.1 of the MacParakeet app and powered AI-assisted testing through
+v0.4--v0.6. With the prompts subcommand and JSON sweep landing in
+[PR #138](https://github.com/moona3k/macparakeet/pull/138), the surface is
+complete enough to commit to. This release marks that commitment.
+
+### Added
+
+- `prompts` subcommand: `list` / `show` / `add` / `set` / `delete` /
+  `restore-defaults` / `run`. UUID-or-name lookup with prefix matching, error
+  surfacing for ambiguous prefixes, refusal to delete built-ins. `prompts run`
+  invokes any LLM provider configured via `--provider --api-key --model`.
+  ([PR #138](https://github.com/moona3k/macparakeet/pull/138))
+- `--json` flag on read-only commands: `history dictations`,
+  `history transcriptions`, `history search`, `history search-transcriptions`,
+  `history favorites`, `stats`, `flow words list`, `flow snippets list`,
+  `health`, `models status`. Convention: ISO-8601 datetimes, pretty-printed
+  output, sorted keys, top-level array for list commands and object for
+  single-record / status commands. Matches the existing `calendar upcoming
+  --json` shape.
+  ([PR #138](https://github.com/moona3k/macparakeet/pull/138))
+- `flow words list --source manual|learned|all` filter. Default `all`.
+  Surfaces the source distinction (user-typed vs vocabulary-learned) that the
+  schema has carried for two releases but the CLI hadn't exposed.
+  ([PR #138](https://github.com/moona3k/macparakeet/pull/138))
+
+### Changed
+
+- Command abstract reframed from "internal developer CLI" to a public surface.
+  The CLI is now positioned as the canonical Swift-native interface to
+  Parakeet TDT on Apple Silicon, with the macOS app as one consumer of it.
+  Strategic context: `plans/active/cli-as-canonical-parakeet-surface.md`.
+
+### Compatibility notes
+
+- Pre-1.0 callers are unaffected. Every existing command and flag retains its
+  prior behavior; the version bump signals "stability commitment going
+  forward," not a breaking-change cliff.
+- The CLI ships inside the `MacParakeet.app` bundle today
+  (`MacParakeet.app/Contents/MacOS/macparakeet-cli`). Standalone install via
+  Homebrew tap is on the roadmap (see plan above) and will not change command
+  semantics.
+- **`--format json` (transcribe, export) vs `--json` (read-only queries)**
+  is deliberate, not a bug. `transcribe` and `export` carry a `--format`
+  selector because they emit one of several formats (`transcribe`: text / json;
+  `export`: txt / markdown / srt / vtt / json); `--json` on read-only query commands is a binary flag because
+  their output shape is conceptually fixed -- it's either JSON or human.
+  Unifying this would be a major-version breaking change; we are not doing
+  that in 1.0.

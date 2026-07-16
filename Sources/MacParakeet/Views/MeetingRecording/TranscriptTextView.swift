@@ -1,0 +1,264 @@
+import AppKit
+import MacParakeetCore
+import MacParakeetViewModels
+import SwiftUI
+
+/// Native NSTextView wrapper for performant, fully-selectable transcript rendering.
+/// Supports drag-selection across the entire transcript with colored speaker headers.
+/// Uses incremental suffix updates so live transcript changes don't rebuild the full document.
+struct TranscriptTextView: NSViewRepresentable {
+    private static let fallbackLayoutSize = CGSize(width: 360, height: 160)
+
+    let lines: [MeetingRecordingPreviewLine]
+    let autoScroll: Bool
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        nsView: NSScrollView,
+        context: Context
+    ) -> CGSize {
+        CGSize(
+            width: proposal.width ?? max(nsView.bounds.width, Self.fallbackLayoutSize.width),
+            height: proposal.height ?? max(nsView.bounds.height, Self.fallbackLayoutSize.height)
+        )
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let textView = NSTextView()
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isRichText = true
+        textView.backgroundColor = .clear
+        textView.drawsBackground = false
+        textView.textContainerInset = NSSize(width: 16, height: 8)
+        textView.isAutomaticLinkDetectionEnabled = false
+        textView.isAutomaticDataDetectionEnabled = false
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.minSize = NSSize(width: 0, height: Self.fallbackLayoutSize.height)
+        textView.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.containerSize = NSSize(
+            width: Self.fallbackLayoutSize.width,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: Self.fallbackLayoutSize.width,
+            height: Self.fallbackLayoutSize.height
+        )
+
+        let scrollView = NSScrollView()
+        scrollView.documentView = textView
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+        scrollView.backgroundColor = .clear
+        scrollView.scrollerStyle = .overlay
+
+        context.coordinator.textView = textView
+        context.coordinator.scrollView = scrollView
+
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = scrollView.documentView as? NSTextView,
+              let storage = textView.textStorage else { return }
+
+        let coordinator = context.coordinator
+        if let firstChangedIndex = firstChangedLineIndex(
+            oldLines: coordinator.lastRenderedLines,
+            newLines: lines
+        ) {
+            let replaceLocation = firstChangedIndex < coordinator.lineRanges.count
+                ? coordinator.lineRanges[firstChangedIndex].location
+                : storage.length
+            let replaceLength = storage.length - replaceLocation
+            let renderedSuffix = buildRenderedSlice(
+                for: lines.suffix(from: firstChangedIndex),
+                startingIndex: firstChangedIndex,
+                previousSpeakerIdentity: firstChangedIndex > 0
+                    ? lines[firstChangedIndex - 1].speakerIdentity
+                    : nil,
+                isFirstInDocument: firstChangedIndex == 0
+            )
+            storage.replaceCharacters(
+                in: NSRange(location: replaceLocation, length: replaceLength),
+                with: renderedSuffix.attributedString
+            )
+            coordinator.lastRenderedLines = lines
+            coordinator.lineRanges =
+                Array(coordinator.lineRanges.prefix(firstChangedIndex))
+                + renderedSuffix.lineRanges.map {
+                    NSRange(location: replaceLocation + $0.location, length: $0.length)
+                }
+
+            if autoScroll {
+                DispatchQueue.main.async {
+                    textView.scrollToEndOfDocument(nil)
+                }
+            }
+        }
+
+        if autoScroll != coordinator.lastAutoScroll, autoScroll {
+            DispatchQueue.main.async {
+                textView.scrollToEndOfDocument(nil)
+            }
+        }
+        coordinator.lastAutoScroll = autoScroll
+    }
+
+    final class Coordinator {
+        var textView: NSTextView?
+        var scrollView: NSScrollView?
+        var lastRenderedLines: [MeetingRecordingPreviewLine] = []
+        var lineRanges: [NSRange] = []
+        var lastAutoScroll: Bool = true
+    }
+
+    private struct RenderedSlice {
+        let attributedString: NSAttributedString
+        let lineRanges: [NSRange]
+    }
+
+    /// Build a rendered suffix for a slice of lines.
+    /// Tracks source-scoped speaker changes so Soniox diarization changes within
+    /// system audio render distinct headers, including incremental suffix updates.
+    private func buildRenderedSlice(
+        for lineSlice: ArraySlice<MeetingRecordingPreviewLine>,
+        startingIndex: Int,
+        previousSpeakerIdentity: String?,
+        isFirstInDocument: Bool
+    ) -> RenderedSlice {
+        let result = NSMutableAttributedString()
+        var lineRanges: [NSRange] = []
+        var previousSpeakerIdentity = previousSpeakerIdentity
+        var isFirstLine = isFirstInDocument
+
+        let bodyFontSize: CGFloat = 14
+        let bodyFont = NSFont.systemFont(ofSize: bodyFontSize, weight: .regular)
+        let serifFont: NSFont = {
+            let descriptor = NSFontDescriptor.preferredFontDescriptor(forTextStyle: .body)
+                .withDesign(.serif) ?? NSFontDescriptor.preferredFontDescriptor(forTextStyle: .body)
+            return NSFont(descriptor: descriptor, size: bodyFontSize) ?? bodyFont
+        }()
+
+        let speakerFont = NSFont.systemFont(ofSize: 11, weight: .medium)
+        let dotFont = NSFont.systemFont(ofSize: 10, weight: .medium)
+        let timestampFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular)
+        let textColor = Self.nsColor(DesignSystem.Colors.textPrimary)
+        let timestampColor = Self.nsColor(DesignSystem.Colors.textTertiary)
+
+        for (offset, line) in lineSlice.enumerated() {
+            let globalIndex = startingIndex + offset
+            let lineStart = result.length
+            let speakerChanged = isFirstLine || line.speakerIdentity != previousSpeakerIdentity
+            isFirstLine = false
+
+            if speakerChanged {
+                let headerPara = NSMutableParagraphStyle()
+                headerPara.lineSpacing = 2
+                headerPara.paragraphSpacingBefore = globalIndex > 0 ? 10 : 0
+                headerPara.paragraphSpacing = 2
+
+                let color = nsColor(for: line)
+
+                let dot = NSAttributedString(string: "\u{25CF} ", attributes: [
+                    .font: dotFont,
+                    .foregroundColor: color,
+                    .paragraphStyle: headerPara,
+                ])
+                result.append(dot)
+
+                let speaker = NSAttributedString(string: "\(line.speakerLabel)  ", attributes: [
+                    .font: speakerFont,
+                    .foregroundColor: nsColor(
+                        for: line,
+                        alpha: DesignSystem.Colors.transcriptSpeakerLabelAlpha
+                    ),
+                ])
+                result.append(speaker)
+
+                let timestamp = NSAttributedString(string: "\(line.timestamp)\n", attributes: [
+                    .font: timestampFont,
+                    .foregroundColor: timestampColor,
+                ])
+                result.append(timestamp)
+            }
+
+            let textPara = NSMutableParagraphStyle()
+            textPara.lineSpacing = 2
+            textPara.firstLineHeadIndent = 11
+            textPara.headIndent = 11
+
+            let text = NSAttributedString(string: "\(line.text)\n", attributes: [
+                .font: serifFont,
+                .foregroundColor: textColor,
+                .paragraphStyle: textPara,
+            ])
+            result.append(text)
+
+            lineRanges.append(NSRange(location: lineStart, length: result.length - lineStart))
+            previousSpeakerIdentity = line.speakerIdentity
+        }
+
+        return RenderedSlice(attributedString: result, lineRanges: lineRanges)
+    }
+
+    private func firstChangedLineIndex(
+        oldLines: [MeetingRecordingPreviewLine],
+        newLines: [MeetingRecordingPreviewLine]
+    ) -> Int? {
+        let sharedCount = min(oldLines.count, newLines.count)
+        for index in 0..<sharedCount where oldLines[index] != newLines[index] {
+            return index
+        }
+        return oldLines.count == newLines.count ? nil : sharedCount
+    }
+
+    private func nsColor(for line: MeetingRecordingPreviewLine, alpha: CGFloat = 1.0) -> NSColor {
+        switch line.source {
+        case .microphone:
+            return Self.nsColor(DesignSystem.Colors.accent, alpha: alpha)
+        case .system:
+            let providerID = line.speakerID?.split(separator: ":", maxSplits: 1).last
+            let paletteIndex = max(0, (providerID.flatMap { Int($0) } ?? 1) - 1)
+            return Self.nsColor(DesignSystem.Colors.speakerColor(for: paletteIndex), alpha: alpha)
+        case .none:
+            return Self.nsColor(DesignSystem.Colors.textSecondary, alpha: alpha)
+        }
+    }
+
+    private static func nsColor(_ color: Color, alpha: CGFloat = 1.0) -> NSColor {
+        NSColor(color).withAlphaComponent(alpha)
+    }
+}
+
+#if DEBUG
+extension TranscriptTextView {
+    func renderedAttributedStringForTesting(
+        lines: ArraySlice<MeetingRecordingPreviewLine>,
+        startingIndex: Int = 0,
+        previousSource: AudioSource? = nil,
+        isFirstInDocument: Bool = true
+    ) -> NSAttributedString {
+        buildRenderedSlice(
+            for: lines,
+            startingIndex: startingIndex,
+            previousSpeakerIdentity: previousSource?.rawValue,
+            isFirstInDocument: isFirstInDocument
+        ).attributedString
+    }
+}
+#endif

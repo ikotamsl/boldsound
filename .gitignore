@@ -1,0 +1,93 @@
+# Auto-memory
+MEMORY.md
+
+# Private journal (telemetry analyses, postmortems, field notes — agent-only)
+journal/
+
+# Claude Code
+.claude/
+
+# Codex agent tooling / evidence artifacts
+.codex/
+
+# no-mistakes local evidence artifacts
+.no-mistakes/evidence/
+
+# Xcode
+.build*/
+.build-swift6-no-whisper/
+DerivedData/
+/dist/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcuserstate
+
+# Swift Package Manager
+.swiftpm/
+
+# Python
+python/.venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.Python
+
+# Node / web tooling
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# IDE
+.idea/
+*.swp
+*.swo
+.vscode/
+
+# Build artifacts
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# Environment
+.env
+.env.local
+
+# Private keys
+*.pem
+
+# Logs
+*.log
+diagnostics/
+logs/
+
+# Test artifacts
+test-results/
+coverage/
+
+# Local tool state / outputs
+.wrangler/
+output/
+tmp/
+
+# Local media artifacts
+Assets/local-videos/
+
+# Data recovery
+recup_dir*/
+
+# Phase-0 Cohere latency spike (throwaway)
+spike/

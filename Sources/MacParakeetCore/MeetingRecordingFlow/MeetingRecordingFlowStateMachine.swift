@@ -1,0 +1,160 @@
+import Foundation
+
+public enum MeetingRecordingPermissionFailure: Equatable, Sendable {
+    case microphone
+    case screenRecording
+}
+
+public enum MeetingRecordingFlowState: Equatable, Sendable {
+    case idle
+    case checkingPermissions
+    case starting
+    case recording
+    case stopping
+    /// The flow only ever finishes by surfacing an error (start/stop failure);
+    /// successful stops return to `.idle` once transcription is queued to the
+    /// background. The message is shown via the `.showError` effect — this
+    /// payload exists so the state stays distinct and equatable in tests.
+    case finishing(error: String)
+}
+
+public enum MeetingRecordingFlowEvent: Equatable, Sendable {
+    case startRequested
+    case permissionsGranted(generation: Int)
+    case permissionsDenied(generation: Int, reason: MeetingRecordingPermissionFailure)
+    case recordingStarted(generation: Int)
+    case startFailed(generation: Int, message: String)
+    case stopRequested
+    case cancelRequested
+    /// Emitted from `MeetingRecordingService`'s terminal capture-failure
+    /// signal when audio capture stops unexpectedly while the state machine
+    /// still believes a recording is in progress (e.g., a USB mic was
+    /// unplugged mid-meeting, `MeetingRecordingService.failCapture` ran).
+    /// Routes through the same stop+transcribe path as `.stopRequested` so
+    /// whatever audio was captured before the failure still becomes a saved
+    /// Transcription.
+    case captureFailed(generation: Int)
+    case recordingQueued(generation: Int, transcriptionID: UUID)
+    case transcriptionFailed(generation: Int, message: String)
+    case dismissRequested
+    case autoDismissExpired(generation: Int)
+}
+
+public enum MeetingRecordingFlowEffect: Equatable, Sendable {
+    case checkPermissions
+    case showRecordingPill
+    case startRecording
+    case showTranscribingState
+    case stopRecordingAndTranscribe
+    case showError(String)
+    case cancelRecording
+    case hidePill
+    /// Successful stop: the recording is durably saved + queued and the flow is
+    /// idle (back-to-back can start immediately), but the floating pill plays a
+    /// self-contained "meeting saved" celebration (Metatron bloom → checkmark)
+    /// and self-dismisses, instead of vanishing the instant queueing finishes.
+    case showSavedCompletion
+    case updateMenuBar(DictationFlowMenuBarState)
+    case presentPermissionAlert(MeetingRecordingPermissionFailure)
+    case startAutoDismissTimer(seconds: Double)
+    case cancelAutoDismissTimer
+}
+
+public struct MeetingRecordingFlowStateMachine: Equatable, Sendable {
+    public private(set) var state: MeetingRecordingFlowState = .idle
+    public private(set) var generation: Int = 0
+
+    public init() {}
+
+    public mutating func handle(_ event: MeetingRecordingFlowEvent) -> [MeetingRecordingFlowEffect] {
+        switch (state, event) {
+        case (.idle, .startRequested):
+            generation += 1
+            state = .checkingPermissions
+            return [.checkPermissions]
+
+        case (.checkingPermissions, .permissionsGranted(let gen)):
+            guard gen == generation else { return [] }
+            state = .starting
+            return [.showRecordingPill, .startRecording, .updateMenuBar(.recording)]
+
+        case (.checkingPermissions, .permissionsDenied(let gen, let reason)):
+            guard gen == generation else { return [] }
+            state = .idle
+            return [.updateMenuBar(.idle), .presentPermissionAlert(reason)]
+
+        case (.checkingPermissions, .cancelRequested):
+            state = .idle
+            return [.cancelRecording, .hidePill, .updateMenuBar(.idle)]
+
+        case (.starting, .recordingStarted(let gen)):
+            guard gen == generation else { return [] }
+            state = .recording
+            return []
+
+        case (.starting, .startFailed(let gen, let message)):
+            guard gen == generation else { return [] }
+            state = .finishing(error: message)
+            return [.showError(message), .updateMenuBar(.idle), .startAutoDismissTimer(seconds: 5)]
+
+        case (.starting, .stopRequested):
+            state = .stopping
+            return []
+
+        case (.stopping, .recordingStarted(let gen)):
+            guard gen == generation else { return [] }
+            state = .stopping
+            return [.showTranscribingState, .updateMenuBar(.processing), .stopRecordingAndTranscribe]
+
+        case (.stopping, .startFailed(let gen, let message)):
+            guard gen == generation else { return [] }
+            state = .finishing(error: message)
+            return [.showError(message), .updateMenuBar(.idle), .startAutoDismissTimer(seconds: 5)]
+
+        case (.stopping, .recordingQueued(let gen, _)):
+            guard gen == generation else { return [] }
+            state = .idle
+            return [.showSavedCompletion, .updateMenuBar(.idle)]
+
+        case (.stopping, .transcriptionFailed(let gen, let message)):
+            guard gen == generation else { return [] }
+            state = .finishing(error: message)
+            return [.showError(message), .updateMenuBar(.idle), .startAutoDismissTimer(seconds: 5)]
+
+        case (.recording, .cancelRequested):
+            state = .idle
+            return [.cancelRecording, .hidePill, .updateMenuBar(.idle)]
+
+        case (.starting, .cancelRequested):
+            state = .idle
+            return [.cancelRecording, .hidePill, .updateMenuBar(.idle)]
+
+        case (.recording, .stopRequested):
+            state = .stopping
+            return [.showTranscribingState, .updateMenuBar(.processing), .stopRecordingAndTranscribe]
+
+        case (.recording, .captureFailed(let gen)):
+            guard gen == generation else { return [] }
+            state = .stopping
+            return [.showTranscribingState, .updateMenuBar(.processing), .stopRecordingAndTranscribe]
+
+        case (.finishing, .dismissRequested):
+            state = .idle
+            return [.cancelAutoDismissTimer, .hidePill]
+
+        case (.finishing, .autoDismissExpired(let gen)):
+            guard gen == generation else { return [] }
+            state = .idle
+            return [.hidePill]
+
+        case (.recording, .dismissRequested),
+            (.starting, .dismissRequested),
+            (.stopping, .dismissRequested),
+            (.checkingPermissions, .dismissRequested):
+            return []
+
+        default:
+            return []
+        }
+    }
+}

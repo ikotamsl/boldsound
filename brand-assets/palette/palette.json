@@ -1,0 +1,86 @@
+{
+  "name": "MacParakeet Pop Palette",
+  "version": "1.0.0",
+  "philosophy": "12 colors anchored on the coral-orange brand accent. Pop in spirit (Warhol, MoMA print culture), restrained in execution (calm, confident, minimal). Every color reads cleanly against both the Ink anchor and the Paper anchor; every color can sit beside the Coral brand accent; every color tiles next to every other color in a grid.",
+  "anchors": {
+    "ink": {
+      "hex": "#0E0F12",
+      "rgb": [14, 15, 18],
+      "role": "Near-black brand anchor. Use for text, dark backgrounds, the line mark on light grounds, and as the dominant color in 'quiet' compositions."
+    },
+    "paper": {
+      "hex": "#F8F4EC",
+      "rgb": [248, 244, 236],
+      "role": "Warm cream brand anchor. Use for light backgrounds, the bird on dark grounds, and to give the palette breathing room."
+    }
+  },
+  "accent": {
+    "coral": {
+      "hex": "#E86B3B",
+      "rgb": [232, 107, 59],
+      "role": "Brand accent (parakeet plumage). Matches DesignSystem.Colors.accent in-app. Always present in any composition that wants brand fidelity."
+    }
+  },
+  "pop": [
+    {
+      "name": "marigold",
+      "hex": "#F4B83A",
+      "rgb": [244, 184, 58],
+      "note": "Warm gold. Sibling to coral on the warm side; honey-bright."
+    },
+    {
+      "name": "lemon",
+      "hex": "#F1E04E",
+      "rgb": [241, 224, 78],
+      "note": "Highlight yellow. Pops on Ink, struggles on Paper — pair with dark grounds."
+    },
+    {
+      "name": "lime",
+      "hex": "#A6D74E",
+      "rgb": [166, 215, 78],
+      "note": "Fresh mid-green. Bridges yellow and forest."
+    },
+    {
+      "name": "forest",
+      "hex": "#2F7A4F",
+      "rgb": [47, 122, 79],
+      "note": "Deep emerald. Anchor green; reads as the calmest of the pop colors."
+    },
+    {
+      "name": "aqua",
+      "hex": "#3FC5C2",
+      "rgb": [63, 197, 194],
+      "note": "Warhol turquoise. Coral's complement — the strongest visual partner for the brand accent."
+    },
+    {
+      "name": "cobalt",
+      "hex": "#2A52BE",
+      "rgb": [42, 82, 190],
+      "note": "Rich blue anchor. Provides structural contrast under any warm hue."
+    },
+    {
+      "name": "lavender",
+      "hex": "#A684E8",
+      "rgb": [166, 132, 232],
+      "note": "Softer pop. Balances the palette — keeps it from reading as 'fruit market'."
+    },
+    {
+      "name": "magenta",
+      "hex": "#E03B92",
+      "rgb": [224, 59, 146],
+      "note": "Hot pink. Warhol staple. Use sparingly — one tile per grid is plenty."
+    },
+    {
+      "name": "brick",
+      "hex": "#B53D2C",
+      "rgb": [181, 61, 44],
+      "note": "Deep red-orange. Coral's grown-up sibling; grounding warm."
+    }
+  ],
+  "guidance": {
+    "tile-pairs": "For Warhol-style tiles, choose a 'ground' (background) and a 'figure' (parakeet). Either may be any palette color, but the pairing must be legible — use at least 3:1 luminance contrast between figure and ground. Coral and aqua are chromatic complements but their luminances are too close to read together; pair each with ink or paper instead. Pairs used in compositions/warhol-3x4.svg, all contrast-tested at 3:1 or stronger: coral+ink, aqua+ink, marigold+ink, magenta+paper, cobalt+paper, forest+lemon, lemon+ink, lavender+ink, brick+paper, ink+marigold, lime+cobalt, paper+ink.",
+    "restraint": "A 12-tile grid does NOT require 12 different colors. A 12-tile grid using 4 colors arranged in a rhythm reads more 'considered' than 12 unique tiles. Pop with discipline.",
+    "brand-fidelity": "If a composition is brand-anchored (website hero, product page, app store), make sure coral or ink-on-paper appears prominently. Pop variants are for moments — anniversaries, launches, social campaigns — not for chrome.",
+    "do-not": "Do not introduce gradients, drop shadows, glows, or 'glassmorphism' on top of these colors. Pop = flat color fields. The bird and the ground are the only two layers."
+  }
+}

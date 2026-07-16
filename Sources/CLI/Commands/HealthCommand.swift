@@ -1,0 +1,337 @@
+import ArgumentParser
+import Foundation
+import MacParakeetCore
+
+struct HealthCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "health",
+        abstract: "Check system health: database, local speech stack, and helper binaries."
+    )
+
+    @Flag(name: .long, help: "Attempt to repair/warm the local speech stack.")
+    var repairModels: Bool = false
+
+    @Option(name: .long, help: "Maximum repair attempts when --repair-models is set.")
+    var repairAttempts: Int = 3
+
+    @Flag(name: .long, help: "Install or update helper binaries such as yt-dlp.")
+    var repairBinaries: Bool = false
+
+    @Flag(name: .long, help: "Emit JSON instead of human-readable output.")
+    var json: Bool = false
+
+    func run() async throws {
+        try await emitJSONOrRethrow(json: json) {
+            try await runHealthCheck()
+        }
+    }
+
+    private func runHealthCheck() async throws {
+        let validatedRepairAttempts: Int?
+        if repairModels {
+            validatedRepairAttempts = try validatedAttempts(repairAttempts)
+        } else {
+            validatedRepairAttempts = nil
+        }
+
+        // Operations are run unconditionally; printing is gated on `!json` so the
+        // final JSON dump is the only thing on stdout in --json mode.
+        var report = HealthReport()
+
+        if !json {
+            print("MacParakeet Health Check")
+            print("========================")
+            print()
+        }
+
+        // 1. Paths
+        report.paths = HealthReport.Paths(
+            appSupport: AppPaths.appSupportDir,
+            database: AppPaths.databasePath,
+            temp: AppPaths.tempDir,
+            bin: AppPaths.binDir,
+            ytDlp: AppPaths.ytDlpBinaryPath
+        )
+        if !json {
+            print("Paths:")
+            print("  App Support: \(report.paths.appSupport)")
+            print("  Database:    \(report.paths.database)")
+            print("  Temp:        \(report.paths.temp)")
+            print("  Bin:         \(report.paths.bin)")
+            print("  yt-dlp:      \(report.paths.ytDlp)")
+            print()
+        }
+
+        // 2. Directories
+        do {
+            try AppPaths.ensureDirectories()
+            report.directoriesOK = true
+        } catch {
+            report.directoriesOK = false
+            report.directoriesError = error.localizedDescription
+        }
+        if !json {
+            print("Directories:")
+            if report.directoriesOK {
+                print("  All directories exist or created.")
+            } else {
+                print("  ERROR: \(report.directoriesError ?? "unknown")")
+            }
+            print()
+        }
+
+        // 3. Database
+        let database = probeHealthDatabase(at: AppPaths.databasePath)
+        report.database = database
+        if !json {
+            print("Database:")
+            switch database.status {
+            case "ok":
+                print("  Status: OK")
+                print("  Dictations: \(database.dictations ?? 0)")
+                print("  Transcriptions: \(database.transcriptions ?? 0)")
+            case "missing":
+                print("  Status: Not created yet (will be created on first use)")
+            case "schema_skew":
+                print("  Status: SCHEMA SKEW — \(database.error ?? "upgrade macparakeet-cli")")
+            default:
+                print("  Status: ERROR — \(database.error ?? "unknown")")
+            }
+            print()
+        }
+
+        // 4. Audio input
+        let audio = loadAudioInputDiagnostics()
+        report.audioInput = HealthReport.AudioInput(
+            deviceCount: audio.devices.count,
+            selectedUID: audio.storedSelectedUID,
+            defaultDeviceName: audio.defaultDevice?.name,
+            builtInDeviceName: audio.builtInDevice?.name
+        )
+        if !json {
+            print("Audio Input:")
+            printAudioInputDiagnostics(audio)
+            print()
+        }
+
+        // 5. Local speech stack
+        let defaults = macParakeetAppDefaults()
+        let sttClient = makeConfiguredSTTClient(defaults: defaults)
+        var sttClientNeedsShutdown = true
+        defer {
+            if sttClientNeedsShutdown {
+                Task { await sttClient.shutdown() }
+            }
+        }
+        let diarizationService = DiarizationService()
+        let status = await loadSpeechStackStatus(
+            sttClient: sttClient,
+            diarizationService: diarizationService,
+            defaults: defaults
+        )
+        report.speechStack = SpeechStackPayload(status: status)
+        if !json {
+            print("Local Speech Stack:")
+            printSpeechStackStatus(status, includeHeader: false)
+        }
+
+        if let repairAttempts = validatedRepairAttempts {
+            if !json { print(); print("Speech-stack repair requested...") }
+            do {
+                let repairOperation = {
+                    try await prepareSpeechStack(
+                        attempts: repairAttempts,
+                        sttClient: sttClient,
+                        diarizationService: diarizationService,
+                        defaults: defaults,
+                        log: { message in if !self.json { print("  \(message)") } }
+                    )
+                }
+                if json {
+                    try await withStandardOutputRedirectedToStandardError(repairOperation)
+                } else {
+                    try await repairOperation()
+                }
+                report.repair = HealthReport.Repair(attempted: true, completed: true, error: nil)
+                if !json { print("Speech-stack repair completed.") }
+            } catch {
+                report.repair = HealthReport.Repair(
+                    attempted: true, completed: false, error: error.localizedDescription)
+                if !json { print("Speech-stack repair failed — \(error.localizedDescription)") }
+            }
+        }
+        if !json { print() }
+        await sttClient.shutdown()
+        sttClientNeedsShutdown = false
+
+        // 6. Bundled FFmpeg
+        let ffmpeg: HealthReport.Binary
+        if let ffmpegPath = BinaryBootstrap.resolveRuntimeFFmpegPath() {
+            let isBundled = ffmpegPath == AppPaths.bundledFFmpegPath()
+            ffmpeg = .init(status: isBundled ? "bundled" : "fallback", path: ffmpegPath, error: nil)
+        } else {
+            ffmpeg = .init(status: "missing", path: nil, error: nil)
+        }
+        report.ffmpeg = ffmpeg
+        if !json {
+            print("FFmpeg:")
+            switch ffmpeg.status {
+            case "bundled": print("  Status: Found bundled binary at \(ffmpeg.path ?? "")")
+            case "fallback": print("  Status: Found development fallback at \(ffmpeg.path ?? "")")
+            default: print("  Status: Missing (bundle + development fallback)")
+            }
+            print()
+        }
+
+        // 7. yt-dlp
+        let ytDlp: HealthReport.Binary
+        if repairBinaries {
+            do {
+                let path = try await BinaryBootstrap().ensureYtDlpAvailable(allowNetworkUpdate: true)
+                ytDlp = .init(status: "ready", path: path, error: nil)
+            } catch {
+                ytDlp = .init(status: "missing", path: nil, error: error.localizedDescription)
+            }
+        } else if let path = BinaryBootstrap.resolveYtDlpPath() {
+            ytDlp = .init(status: "ready", path: path, error: nil)
+        } else {
+            ytDlp = .init(
+                status: "missing",
+                path: nil,
+                error: "Run `macparakeet-cli health --repair-binaries` or transcribe a media URL to install yt-dlp."
+            )
+        }
+        report.ytDlp = ytDlp
+        if !json {
+            print("yt-dlp:")
+            switch ytDlp.status {
+            case "ready": print("  Status: Ready at \(ytDlp.path ?? "")")
+            default:
+                print("  Status: Not available — \(ytDlp.error ?? "unknown")")
+            }
+            print()
+        }
+
+        // 8. Calendar
+        let permission = CalendarService.shared.permissionStatus
+        let calendarStatus: String
+        switch permission {
+        case .granted: calendarStatus = "granted"
+        case .denied: calendarStatus = "denied"
+        case .notDetermined: calendarStatus = "notDetermined"
+        }
+        var calendarsVisible: Int?
+        if permission == .granted {
+            calendarsVisible = await CalendarService.shared.availableCalendars().count
+        }
+        report.calendar = HealthReport.Calendar(permission: calendarStatus, calendarsVisible: calendarsVisible)
+        if !json {
+            print("Calendar (EventKit):")
+            switch permission {
+            case .granted:
+                print("  Status: Granted")
+                if let n = calendarsVisible { print("  Calendars visible: \(n)") }
+            case .denied:
+                print("  Status: Denied (open System Settings → Privacy & Security → Calendars)")
+            case .notDetermined:
+                print("  Status: Not requested (run the app once and grant access)")
+            }
+            print()
+            print("Done.")
+        } else {
+            try printJSON(report)
+        }
+    }
+}
+
+func probeHealthDatabase(at path: String) -> HealthDatabaseReport {
+    guard FileManager.default.fileExists(atPath: path) else {
+        return .init(status: "missing", dictations: nil, transcriptions: nil, error: nil)
+    }
+
+    do {
+        let unknownMigrations = try DatabaseManager.unknownAppliedMigrationIdentifiers(at: path)
+        if !unknownMigrations.isEmpty {
+            return .init(
+                status: "schema_skew",
+                dictations: nil,
+                transcriptions: nil,
+                error: databaseSchemaSkewMessage(unknownMigrations: unknownMigrations)
+            )
+        }
+
+        let dbManager = try DatabaseManager(path: path)
+        let dictStats = try DictationRepository(dbQueue: dbManager.dbQueue).stats()
+        let transcriptions = try TranscriptionRepository(dbQueue: dbManager.dbQueue).fetchAll(limit: nil)
+        return .init(
+            status: "ok",
+            dictations: dictStats.totalCount,
+            transcriptions: transcriptions.count,
+            error: nil
+        )
+    } catch {
+        return .init(status: "error", dictations: nil, transcriptions: nil, error: error.localizedDescription)
+    }
+}
+
+private func databaseSchemaSkewMessage(unknownMigrations: [String]) -> String {
+    let migrationList = unknownMigrations.prefix(3).joined(separator: ", ")
+    let suffix = unknownMigrations.count > 3 ? ", ..." : ""
+    return
+        "This database has been migrated by a newer MacParakeet app than this macparakeet-cli build understands (\(migrationList)\(suffix)). Upgrade macparakeet-cli and retry."
+}
+
+struct HealthDatabaseReport: Encodable, Equatable {
+    let status: String  // "ok" | "missing" | "schema_skew" | "error"
+    let dictations: Int?
+    let transcriptions: Int?
+    let error: String?
+}
+
+// Health JSON payload. Local to the CLI so adding diagnostic fields here
+// doesn't require touching the Core layer.
+private struct HealthReport: Encodable {
+    var paths: Paths = .empty
+    var directoriesOK: Bool = false
+    var directoriesError: String?
+    var database: HealthDatabaseReport?
+    var audioInput: AudioInput?
+    var speechStack: SpeechStackPayload?
+    var repair: Repair?
+    var ffmpeg: Binary?
+    var ytDlp: Binary?
+    var calendar: Calendar?
+
+    struct Paths: Encodable {
+        let appSupport: String
+        let database: String
+        let temp: String
+        let bin: String
+        let ytDlp: String
+        static let empty = Paths(appSupport: "", database: "", temp: "", bin: "", ytDlp: "")
+    }
+
+    struct AudioInput: Encodable {
+        let deviceCount: Int
+        let selectedUID: String?
+        let defaultDeviceName: String?
+        let builtInDeviceName: String?
+    }
+
+    struct Repair: Encodable {
+        let attempted: Bool
+        let completed: Bool
+        let error: String?
+    }
+
+    struct Binary: Encodable {
+        let status: String
+        let path: String?
+        let error: String?
+    }
+
+    struct Calendar: Encodable {
+        let permission: String  // "granted" | "denied" | "notDetermined"
+        let calendarsVisible: Int?
+    }
+}

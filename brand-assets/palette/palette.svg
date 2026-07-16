@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" role="img" aria-label="MacParakeet Pop Palette">
+  <title>MacParakeet Pop Palette</title>
+  <desc>12 curated colors anchored on the coral-orange brand accent. See palette.json for hex codes and guidance.</desc>
+
+  <!-- Paper background with breathing room -->
+  <rect width="1600" height="900" fill="#F8F4EC"/>
+
+  <g font-family="-apple-system, 'SF Pro Text', 'Helvetica Neue', sans-serif">
+    <!-- Header -->
+    <g transform="translate(80, 90)">
+      <text x="0" y="0" font-size="44" font-weight="700" fill="#0E0F12" letter-spacing="-0.5">MacParakeet · Pop Palette</text>
+      <text x="0" y="34" font-size="18" font-weight="400" fill="#0E0F12" opacity="0.6">Twelve colors. Coral leads. Ink and paper anchor.</text>
+    </g>
+
+    <!-- Swatch grid: 4 columns × 3 rows = 12 tiles -->
+    <!-- Tile size: 320 wide × 200 tall, 24px gap, starts at (80, 200) -->
+
+    <!-- Row 1: Ink, Paper, Coral, Marigold -->
+    <g transform="translate(80, 200)">
+      <rect width="320" height="200" fill="#0E0F12"/>
+      <text x="20" y="170" font-size="16" font-weight="600" fill="#F8F4EC">INK</text>
+      <text x="20" y="188" font-size="13" fill="#F8F4EC" opacity="0.7">#0E0F12</text>
+    </g>
+    <g transform="translate(424, 200)">
+      <rect width="320" height="200" fill="#F8F4EC" stroke="#0E0F12" stroke-opacity="0.08"/>
+      <text x="20" y="170" font-size="16" font-weight="600" fill="#0E0F12">PAPER</text>
+      <text x="20" y="188" font-size="13" fill="#0E0F12" opacity="0.6">#F8F4EC</text>
+    </g>
+    <g transform="translate(768, 200)">
+      <rect width="320" height="200" fill="#E86B3B"/>
+      <text x="20" y="170" font-size="16" font-weight="600" fill="#F8F4EC">CORAL</text>
+      <text x="20" y="188" font-size="13" fill="#F8F4EC" opacity="0.85">#E86B3B · brand accent</text>
+    </g>
+    <g transform="translate(1112, 200)">
+      <rect width="320" height="200" fill="#F4B83A"/>
+      <text x="20" y="170" font-size="16" font-weight="600" fill="#0E0F12">MARIGOLD</text>
+      <text x="20" y="188" font-size="13" fill="#0E0F12" opacity="0.7">#F4B83A</text>
+    </g>
+
+    <!-- Row 2: Lemon, Lime, Forest, Aqua -->
+    <g transform="translate(80, 424)">
+      <rect width="320" height="200" fill="#F1E04E"/>
+      <text x="20" y="170" font-size="16" font-weight="600" fill="#0E0F12">LEMON</text>
+      <text x="20" y="188" font-size="13" fill="#0E0F12" opacity="0.7">#F1E04E</text>
+    </g>
+    <g transform="translate(424, 424)">
+      <rect width="320" height="200" fill="#A6D74E"/>
+      <text x="20" y="170" font-size="16" font-weight="600" fill="#0E0F12">LIME</text>
+      <text x="20" y="188" font-size="13" fill="#0E0F12" opacity="0.7">#A6D74E</text>
+    </g>
+    <g transform="translate(768, 424)">
+      <rect width="320" height="200" fill="#2F7A4F"/>
+      <text x="20" y="170" font-size="16" font-weight="600" fill="#F8F4EC">FOREST</text>
+      <text x="20" y="188" font-size="13" fill="#F8F4EC" opacity="0.85">#2F7A4F</text>
+    </g>
+    <g transform="translate(1112, 424)">
+      <rect width="320" height="200" fill="#3FC5C2"/>
+      <text x="20" y="170" font-size="16" font-weight="600" fill="#0E0F12">AQUA</text>
+      <text x="20" y="188" font-size="13" fill="#0E0F12" opacity="0.75">#3FC5C2 · coral's complement</text>
+    </g>
+
+    <!-- Row 3: Cobalt, Lavender, Magenta, Brick -->
+    <g transform="translate(80, 648)">
+      <rect width="320" height="200" fill="#2A52BE"/>
+      <text x="20" y="170" font-size="16" font-weight="600" fill="#F8F4EC">COBALT</text>
+      <text x="20" y="188" font-size="13" fill="#F8F4EC" opacity="0.85">#2A52BE</text>
+    </g>
+    <g transform="translate(424, 648)">
+      <rect width="320" height="200" fill="#A684E8"/>
+      <text x="20" y="170" font-size="16" font-weight="600" fill="#0E0F12">LAVENDER</text>
+      <text x="20" y="188" font-size="13" fill="#0E0F12" opacity="0.75">#A684E8</text>
+    </g>
+    <g transform="translate(768, 648)">
+      <rect width="320" height="200" fill="#E03B92"/>
+      <text x="20" y="170" font-size="16" font-weight="600" fill="#F8F4EC">MAGENTA</text>
+      <text x="20" y="188" font-size="13" fill="#F8F4EC" opacity="0.9">#E03B92</text>
+    </g>
+    <g transform="translate(1112, 648)">
+      <rect width="320" height="200" fill="#B53D2C"/>
+      <text x="20" y="170" font-size="16" font-weight="600" fill="#F8F4EC">BRICK</text>
+      <text x="20" y="188" font-size="13" fill="#F8F4EC" opacity="0.85">#B53D2C</text>
+    </g>
+  </g>
+</svg>

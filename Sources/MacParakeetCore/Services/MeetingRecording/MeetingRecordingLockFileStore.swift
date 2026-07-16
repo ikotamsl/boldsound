@@ -1,0 +1,329 @@
+import Darwin
+import Foundation
+
+public enum MeetingRecordingLockState: String, Codable, Sendable, Equatable, CaseIterable {
+    case recording
+    case awaitingTranscription
+}
+
+public struct MeetingRecordingLockFile: Codable, Sendable, Equatable {
+    /// Schema 2 distinguishes an independently captured meeting speech-engine
+    /// route from schema 1 locks, which always encoded the former shared route.
+    /// Other optional fields remain backward-compatible additions.
+    /// See ADR-020 §9. The version guard in `MeetingRecordingLockFileStore.read()`
+    /// uses `<=` so a lock file written by an OLDER app version is still
+    /// readable; a future bump only needs to keep this property + bump the
+    /// constant, not add a migration path. Lock files written by a NEWER app
+    /// version are intentionally treated as opaque and skipped (we cannot
+    /// know which fields they require).
+    public static let currentSchemaVersion = 2
+    public static let fileName = "recording.lock"
+
+    public let schemaVersion: Int
+    public let sessionId: UUID
+    public let startedAt: Date
+    public let pid: Int32
+    public let displayName: String
+    public let state: MeetingRecordingLockState
+    public let speechEngine: SpeechEngineSelection
+    /// Whether `speechEngine` was explicitly persisted by the recording build.
+    /// Legacy locks without the field retain the Parakeet decode fallback but
+    /// must use the current final-transcription route during recovery.
+    public let speechEngineWasCaptured: Bool
+    public let startContext: MeetingStartContext?
+    public let calendarEventSnapshot: MeetingCalendarSnapshot?
+    /// Free-form notes the user typed during the meeting. Persisted on
+    /// every notepad debounce so a crash recovers what the user had written
+    /// up to the last debounce fire. Decoded independently of the rest of
+    /// the lock file (ADR-020 §9): a malformed `notes` value cannot block
+    /// recovery of the audio metadata.
+    public let notes: String?
+    public let folderURL: URL?
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case sessionId
+        case startedAt
+        case pid
+        case displayName
+        case state
+        case speechEngine
+        case startContext
+        case calendarEventSnapshot
+        case notes
+    }
+
+    public init(
+        schemaVersion: Int = MeetingRecordingLockFile.currentSchemaVersion,
+        sessionId: UUID,
+        startedAt: Date,
+        pid: Int32 = ProcessInfo.processInfo.processIdentifier,
+        displayName: String,
+        state: MeetingRecordingLockState = .recording,
+        speechEngine: SpeechEngineSelection = SpeechEngineSelection(engine: .parakeet),
+        speechEngineWasCaptured: Bool = true,
+        startContext: MeetingStartContext? = nil,
+        calendarEventSnapshot: MeetingCalendarSnapshot? = nil,
+        notes: String? = nil,
+        folderURL: URL? = nil
+    ) {
+        self.schemaVersion = schemaVersion
+        self.sessionId = sessionId
+        self.startedAt = startedAt
+        self.pid = pid
+        self.displayName = displayName
+        self.state = state
+        self.speechEngine = speechEngine
+        self.speechEngineWasCaptured = speechEngineWasCaptured
+        self.startContext = startContext
+        self.calendarEventSnapshot = calendarEventSnapshot
+        self.notes = notes
+        self.folderURL = folderURL
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        sessionId = try container.decode(UUID.self, forKey: .sessionId)
+        startedAt = try container.decode(Date.self, forKey: .startedAt)
+        pid = try container.decode(Int32.self, forKey: .pid)
+        displayName = try container.decode(String.self, forKey: .displayName)
+        state = try container.decodeIfPresent(MeetingRecordingLockState.self, forKey: .state) ?? .recording
+        let decodedSpeechEngine = try container.decodeIfPresent(SpeechEngineSelection.self, forKey: .speechEngine)
+        speechEngine = decodedSpeechEngine ?? SpeechEngineSelection(engine: .parakeet)
+        speechEngineWasCaptured = schemaVersion >= 2 && decodedSpeechEngine != nil
+        startContext = (try? container.decodeIfPresent(MeetingStartContext.self, forKey: .startContext)) ?? nil
+        // Calendar snapshots are best-effort context. A malformed optional
+        // snapshot must not block lock-file recovery of the audio metadata.
+        calendarEventSnapshot = (try? container.decodeIfPresent(
+            MeetingCalendarSnapshot.self,
+            forKey: .calendarEventSnapshot
+        )) ?? nil
+        // Notes are decoded independently — see ADR-020 §9. If a future encoder
+        // bug or hand-edited file produces a malformed `notes` value, recovery
+        // of the audio metadata still succeeds; only the typed notes are lost.
+        notes = (try? container.decodeIfPresent(String.self, forKey: .notes)) ?? nil
+        folderURL = nil
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(schemaVersion, forKey: .schemaVersion)
+        try container.encode(sessionId, forKey: .sessionId)
+        try container.encode(startedAt, forKey: .startedAt)
+        try container.encode(pid, forKey: .pid)
+        try container.encode(displayName, forKey: .displayName)
+        try container.encode(state, forKey: .state)
+        if speechEngineWasCaptured {
+            try container.encode(speechEngine, forKey: .speechEngine)
+        }
+        try container.encodeIfPresent(startContext, forKey: .startContext)
+        try container.encodeIfPresent(calendarEventSnapshot, forKey: .calendarEventSnapshot)
+        try container.encodeIfPresent(notes, forKey: .notes)
+    }
+
+    public func withFolderURL(_ folderURL: URL) -> MeetingRecordingLockFile {
+        MeetingRecordingLockFile(
+            schemaVersion: schemaVersion,
+            sessionId: sessionId,
+            startedAt: startedAt,
+            pid: pid,
+            displayName: displayName,
+            state: state,
+            speechEngine: speechEngine,
+            speechEngineWasCaptured: speechEngineWasCaptured,
+            startContext: startContext,
+            calendarEventSnapshot: calendarEventSnapshot,
+            notes: notes,
+            folderURL: folderURL
+        )
+    }
+
+    public func withState(_ state: MeetingRecordingLockState) -> MeetingRecordingLockFile {
+        MeetingRecordingLockFile(
+            schemaVersion: schemaVersion,
+            sessionId: sessionId,
+            startedAt: startedAt,
+            pid: pid,
+            displayName: displayName,
+            state: state,
+            speechEngine: speechEngine,
+            speechEngineWasCaptured: speechEngineWasCaptured,
+            startContext: startContext,
+            calendarEventSnapshot: calendarEventSnapshot,
+            notes: notes,
+            folderURL: folderURL
+        )
+    }
+
+    public func withNotes(_ notes: String?) -> MeetingRecordingLockFile {
+        MeetingRecordingLockFile(
+            schemaVersion: schemaVersion,
+            sessionId: sessionId,
+            startedAt: startedAt,
+            pid: pid,
+            displayName: displayName,
+            state: state,
+            speechEngine: speechEngine,
+            speechEngineWasCaptured: speechEngineWasCaptured,
+            startContext: startContext,
+            calendarEventSnapshot: calendarEventSnapshot,
+            notes: notes,
+            folderURL: folderURL
+        )
+    }
+}
+
+public protocol MeetingRecordingLockFileStoring: Sendable {
+    func write(_ file: MeetingRecordingLockFile, folderURL: URL) throws
+    func read(folderURL: URL) throws -> MeetingRecordingLockFile?
+    func delete(folderURL: URL) throws
+    func discoverOrphans(meetingsRoot: URL) throws -> [MeetingRecordingLockFile]
+}
+
+public protocol ProcessAliveChecking: Sendable {
+    func isAlive(pid: Int32) -> Bool
+}
+
+public struct LiveProcessChecker: ProcessAliveChecking {
+    public init() {}
+
+    public func isAlive(pid: Int32) -> Bool {
+        guard pid > 0 else { return false }
+
+        errno = 0
+        if kill(pid, 0) == 0 {
+            return true
+        }
+        return errno == EPERM
+    }
+}
+
+public final class MeetingRecordingLockFileStore: MeetingRecordingLockFileStoring {
+    private let processChecker: any ProcessAliveChecking
+
+    public init(processChecker: any ProcessAliveChecking = LiveProcessChecker()) {
+        self.processChecker = processChecker
+    }
+
+    public static func lockFileURL(for folderURL: URL) -> URL {
+        folderURL.appendingPathComponent(MeetingRecordingLockFile.fileName)
+    }
+
+    public func write(_ file: MeetingRecordingLockFile, folderURL: URL) throws {
+        try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+        let data = try JSONEncoder.meetingRecordingLockFile.encode(file)
+        try data.write(to: Self.lockFileURL(for: folderURL), options: .atomic)
+    }
+
+    public func read(folderURL: URL) throws -> MeetingRecordingLockFile? {
+        let lockFileURL = Self.lockFileURL(for: folderURL)
+        guard FileManager.default.fileExists(atPath: lockFileURL.path) else {
+            return nil
+        }
+
+        do {
+            let data = try Data(contentsOf: lockFileURL)
+            let lockFile = try JSONDecoder.meetingRecordingLockFile.decode(
+                MeetingRecordingLockFile.self,
+                from: data
+            )
+            // Accept any version up to and including the current — older
+            // schemas decode via `decodeIfPresent` for added fields. A
+            // newer schema is opaque to us, so skip it rather than risk
+            // misinterpreting required fields we don't know about yet.
+            guard lockFile.schemaVersion <= MeetingRecordingLockFile.currentSchemaVersion else {
+                return nil
+            }
+            return lockFile.withFolderURL(folderURL)
+        } catch is DecodingError {
+            return nil
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return nil
+        }
+    }
+
+    public func delete(folderURL: URL) throws {
+        let lockFileURL = Self.lockFileURL(for: folderURL)
+        guard FileManager.default.fileExists(atPath: lockFileURL.path) else {
+            return
+        }
+        try FileManager.default.removeItem(at: lockFileURL)
+    }
+
+    public func discoverOrphans(meetingsRoot: URL) throws -> [MeetingRecordingLockFile] {
+        // Orphans are crashed sessions: a lock file whose owning process is no
+        // longer alive. Their audio is recoverable, not in active use.
+        try sortedSessions(meetingsRoot: meetingsRoot) { !processChecker.isAlive(pid: $0.pid) }
+    }
+
+    /// Lock files in `meetingsRoot` whose owning process is still alive — i.e.
+    /// meetings actively recording or awaiting transcription inside a running
+    /// MacParakeet instance. The inverse of `discoverOrphans`.
+    ///
+    /// Used by out-of-process callers (the CLI) that cannot observe the GUI's
+    /// live recording state but must avoid clobbering an in-progress session's
+    /// folder on disk. Same disk signal the recovery service already trusts:
+    /// `pid` liveness via `ProcessAliveChecking`.
+    public func discoverActiveSessions(meetingsRoot: URL) throws -> [MeetingRecordingLockFile] {
+        try sortedSessions(meetingsRoot: meetingsRoot) { processChecker.isAlive(pid: $0.pid) }
+    }
+
+    /// Every readable recording lock under `meetingsRoot`, regardless of PID
+    /// liveness or state. Destructive retention paths use this stricter scan:
+    /// a dead-owner `.awaitingTranscription` lock still represents saved audio
+    /// that has not been finalized into a transcript yet.
+    public func discoverAnySessions(meetingsRoot: URL) throws -> [MeetingRecordingLockFile] {
+        try sortedSessions(meetingsRoot: meetingsRoot) { _ in true }
+    }
+
+    private func sortedSessions(
+        meetingsRoot: URL,
+        where predicate: (MeetingRecordingLockFile) -> Bool
+    ) throws -> [MeetingRecordingLockFile] {
+        guard FileManager.default.fileExists(atPath: meetingsRoot.path) else {
+            return []
+        }
+
+        let sessionFolders = try FileManager.default.contentsOfDirectory(
+            at: meetingsRoot,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )
+
+        var matches: [MeetingRecordingLockFile] = []
+        for folderURL in sessionFolders {
+            guard try folderURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true,
+                  let lockFile = try read(folderURL: folderURL),
+                  predicate(lockFile) else {
+                continue
+            }
+
+            matches.append(lockFile)
+        }
+
+        return matches.sorted {
+            if $0.startedAt == $1.startedAt {
+                return ($0.folderURL?.path ?? "") < ($1.folderURL?.path ?? "")
+            }
+            return $0.startedAt < $1.startedAt
+        }
+    }
+}
+
+private extension JSONEncoder {
+    static var meetingRecordingLockFile: JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return encoder
+    }
+}
+
+private extension JSONDecoder {
+    static var meetingRecordingLockFile: JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
+    }
+}

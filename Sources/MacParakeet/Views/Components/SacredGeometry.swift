@@ -1,0 +1,773 @@
+import AppKit
+import SwiftUI
+
+// MARK: - Triangle Shape
+
+/// Equilateral triangle inscribed in a circle.
+struct TriangleShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        let radius = min(rect.width, rect.height) / 2
+        var path = Path()
+        for i in 0..<3 {
+            let angle = (Double(i) * 120.0 - 90.0) * .pi / 180.0
+            let point = CGPoint(
+                x: center.x + Foundation.cos(angle) * radius,
+                y: center.y + Foundation.sin(angle) * radius
+            )
+            if i == 0 { path.move(to: point) } else { path.addLine(to: point) }
+        }
+        path.closeSubpath()
+        return path
+    }
+}
+
+// MARK: - Spinner Ring (Compact Merkaba)
+
+/// Merkaba-inspired spinner — two counter-rotating triangles with glowing vertices
+/// and a pulsing center. Used in dictation overlay processing state (26x26).
+///
+/// Core Animation owns the continuous motion so displaying this spinner does not
+/// re-evaluate its surrounding SwiftUI hierarchy every frame.
+struct SpinnerRingView: View {
+    var size: CGFloat = 26
+    var revolutionDuration: Double = 3.0
+    var tintColor: Color = .white
+    var animate: Bool = true
+
+    var body: some View {
+        SpinnerRingRepresentable(
+            size: size,
+            revolutionDuration: revolutionDuration,
+            tint: NSColor(tintColor),
+            animate: animate
+        )
+        .frame(width: size, height: size)
+    }
+}
+
+private struct SpinnerRingRepresentable: NSViewRepresentable {
+    let size: CGFloat
+    let revolutionDuration: Double
+    let tint: NSColor
+    let animate: Bool
+
+    func makeNSView(context: Context) -> SpinnerRingNSView {
+        SpinnerRingNSView()
+    }
+
+    func updateNSView(_ nsView: SpinnerRingNSView, context: Context) {
+        nsView.update(
+            size: size,
+            revolutionDuration: revolutionDuration,
+            tint: tint,
+            animate: animate
+        )
+    }
+
+    static func dismantleNSView(_ nsView: SpinnerRingNSView, coordinator: Void) {
+        nsView.dismantle()
+    }
+
+    func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        nsView: SpinnerRingNSView,
+        context: Context
+    ) -> CGSize? {
+        CGSize(width: size, height: size)
+    }
+}
+
+/// Layer-backed renderer for `SpinnerRingView`.
+///
+/// SwiftUI owns configuration and accessibility; Core Animation interpolates
+/// rotations and pulses on the render server.
+final class SpinnerRingNSView: NSView {
+    private let ringLayer = CAShapeLayer()
+    private let clockwiseLayer = CALayer()
+    private let clockwiseTriangleLayer = CAShapeLayer()
+    private let clockwiseVerticesLayer = CAShapeLayer()
+    private let counterclockwiseLayer = CALayer()
+    private let counterclockwiseTriangleLayer = CAShapeLayer()
+    private let counterclockwiseVerticesLayer = CAShapeLayer()
+    private let centerLayer = CAShapeLayer()
+
+    private var spinnerSize: CGFloat = 26
+    private var revolutionDuration: Double = 3
+    private var tint = NSColor.white
+    private var isAnimating = false
+    private var didBuildLayers = false
+    private var laidOutSize: CGFloat?
+
+    override var isFlipped: Bool { true }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: spinnerSize, height: spinnerSize)
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layerContentsRedrawPolicy = .never
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        wantsLayer = true
+        layerContentsRedrawPolicy = .never
+    }
+
+    override func layout() {
+        super.layout()
+        buildLayersIfNeeded()
+        layoutLayers()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        guard didBuildLayers else { return }
+        applyTint()
+    }
+
+    func update(size: CGFloat, revolutionDuration: Double, tint: NSColor, animate: Bool) {
+        buildLayersIfNeeded()
+
+        let sizeChanged = spinnerSize != size
+        if sizeChanged {
+            spinnerSize = size
+            invalidateIntrinsicContentSize()
+            needsLayout = true
+        }
+
+        if sizeChanged || !self.tint.isEqual(tint) {
+            self.tint = tint
+            applyTint()
+        }
+
+        let timingChanged = self.revolutionDuration != revolutionDuration
+        self.revolutionDuration = revolutionDuration
+        let animationStateChanged = isAnimating != animate
+        isAnimating = animate
+
+        if animate && animationStateChanged {
+            startAnimations()
+        } else if animate && timingChanged {
+            retimeRotationAnimations()
+        } else if animationStateChanged {
+            stopAnimations()
+        }
+    }
+
+    func dismantle() {
+        removeAnimations()
+        isAnimating = false
+    }
+
+    var testHook_hasRenderableGeometry: Bool {
+        ringLayer.path != nil
+            && clockwiseTriangleLayer.path != nil
+            && counterclockwiseTriangleLayer.path != nil
+            && clockwiseVerticesLayer.path != nil
+            && counterclockwiseVerticesLayer.path != nil
+            && centerLayer.path != nil
+    }
+
+    var testHook_activeAnimationKeys: [String] {
+        var keys: [String] = []
+        if clockwiseLayer.animation(forKey: "spin") != nil { keys.append("clockwise.spin") }
+        if counterclockwiseLayer.animation(forKey: "spin") != nil { keys.append("counterclockwise.spin") }
+        if centerLayer.animation(forKey: "pulse") != nil { keys.append("center.pulse") }
+        if clockwiseVerticesLayer.animation(forKey: "pulse") != nil
+            || counterclockwiseVerticesLayer.animation(forKey: "pulse") != nil
+        {
+            keys.append("vertices.pulse")
+        }
+        return keys.sorted()
+    }
+
+    var testHook_animationDurations: [String: Double] {
+        [
+            "center.pulse": centerLayer.animation(forKey: "pulse")?.duration,
+            "clockwise.spin": clockwiseLayer.animation(forKey: "spin")?.duration,
+            "counterclockwise.spin": counterclockwiseLayer.animation(forKey: "spin")?.duration,
+            "vertices.pulse": clockwiseVerticesLayer.animation(forKey: "pulse")?.duration,
+        ].compactMapValues { $0 }
+    }
+
+    private func buildLayersIfNeeded() {
+        guard !didBuildLayers, let rootLayer = layer else { return }
+        didBuildLayers = true
+
+        rootLayer.masksToBounds = false
+        ringLayer.fillColor = NSColor.clear.cgColor
+        ringLayer.lineWidth = 0.5
+        rootLayer.addSublayer(ringLayer)
+
+        configureTriangle(clockwiseLayer, shape: clockwiseTriangleLayer, vertices: clockwiseVerticesLayer)
+        configureTriangle(
+            counterclockwiseLayer,
+            shape: counterclockwiseTriangleLayer,
+            vertices: counterclockwiseVerticesLayer
+        )
+        rootLayer.addSublayer(clockwiseLayer)
+        rootLayer.addSublayer(counterclockwiseLayer)
+
+        centerLayer.strokeColor = nil
+        rootLayer.addSublayer(centerLayer)
+        applyTint()
+    }
+
+    private func configureTriangle(_ container: CALayer, shape: CAShapeLayer, vertices: CAShapeLayer) {
+        container.masksToBounds = false
+        shape.fillColor = NSColor.clear.cgColor
+        shape.lineWidth = 0.8
+        shape.lineJoin = .round
+        vertices.strokeColor = nil
+        container.addSublayer(shape)
+        container.addSublayer(vertices)
+    }
+
+    private func layoutLayers() {
+        guard laidOutSize != spinnerSize else { return }
+        laidOutSize = spinnerSize
+
+        let bounds = CGRect(origin: .zero, size: CGSize(width: spinnerSize, height: spinnerSize))
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        let radius = spinnerSize * 0.423
+        let trianglePath = makeTrianglePath(center: center, radius: radius)
+        let vertexPath = makeVertexPath(center: center, radius: radius)
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+
+        ringLayer.frame = bounds
+        ringLayer.path = CGPath(ellipseIn: bounds, transform: nil)
+
+        clockwiseLayer.setAffineTransform(.identity)
+        counterclockwiseLayer.setAffineTransform(.identity)
+        for container in [clockwiseLayer, counterclockwiseLayer] {
+            container.frame = bounds
+        }
+        for triangle in [clockwiseTriangleLayer, counterclockwiseTriangleLayer] {
+            triangle.frame = bounds
+            triangle.path = trianglePath
+        }
+        for vertices in [clockwiseVerticesLayer, counterclockwiseVerticesLayer] {
+            vertices.frame = bounds
+            vertices.path = vertexPath
+            vertices.shadowPath = vertexPath
+        }
+
+        let centerDiameter = spinnerSize * 0.115
+        let centerPath = CGPath(
+            ellipseIn: CGRect(
+                x: center.x - centerDiameter / 2,
+                y: center.y - centerDiameter / 2,
+                width: centerDiameter,
+                height: centerDiameter
+            ),
+            transform: nil
+        )
+        centerLayer.frame = bounds
+        centerLayer.path = centerPath
+        centerLayer.shadowPath = centerPath
+
+        applyModelState(animated: isAnimating)
+        CATransaction.commit()
+    }
+
+    private func makeTrianglePath(center: CGPoint, radius: CGFloat) -> CGPath {
+        TriangleShape().path(
+            in: CGRect(
+                x: center.x - radius,
+                y: center.y - radius,
+                width: radius * 2,
+                height: radius * 2
+            )
+        ).cgPath
+    }
+
+    private func makeVertexPath(center: CGPoint, radius: CGFloat) -> CGPath {
+        let path = CGMutablePath()
+        let diameter = spinnerSize * 0.096
+        for index in 0..<3 {
+            let angle = (CGFloat(index) * 120 - 90) * .pi / 180
+            let point = CGPoint(
+                x: center.x + cos(angle) * radius,
+                y: center.y + sin(angle) * radius
+            )
+            path.addEllipse(
+                in: CGRect(
+                    x: point.x - diameter / 2,
+                    y: point.y - diameter / 2,
+                    width: diameter,
+                    height: diameter
+                ))
+        }
+        return path
+    }
+
+    private func applyTint() {
+        effectiveAppearance.performAsCurrentDrawingAppearance { [self] in
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            ringLayer.strokeColor = tint.withAlphaComponent(tint.alphaComponent * 0.05).cgColor
+            clockwiseTriangleLayer.strokeColor = tint.withAlphaComponent(tint.alphaComponent * 0.35).cgColor
+            counterclockwiseTriangleLayer.strokeColor = tint.withAlphaComponent(tint.alphaComponent * 0.2).cgColor
+            clockwiseVerticesLayer.fillColor = tint.cgColor
+            counterclockwiseVerticesLayer.fillColor = tint.cgColor
+            centerLayer.fillColor = tint.cgColor
+
+            for vertices in [clockwiseVerticesLayer, counterclockwiseVerticesLayer] {
+                vertices.shadowColor = tint.cgColor
+                vertices.shadowOpacity = 0.4
+                vertices.shadowRadius = spinnerSize * 0.115
+            }
+            centerLayer.shadowColor = tint.cgColor
+            centerLayer.shadowOpacity = 0.5
+            centerLayer.shadowRadius = spinnerSize * 0.154
+            CATransaction.commit()
+        }
+    }
+
+    private func applyModelState(animated: Bool) {
+        clockwiseLayer.setAffineTransform(.identity)
+        counterclockwiseLayer.setAffineTransform(
+            animated ? .identity : CGAffineTransform(rotationAngle: .pi / 3)
+        )
+        centerLayer.opacity = animated ? 0.3 : 0.7
+        clockwiseVerticesLayer.opacity = animated ? 0.6 : 0.85
+        counterclockwiseVerticesLayer.opacity = animated ? 0.42 : 0.595
+    }
+
+    private func startAnimations() {
+        removeAnimations()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        applyModelState(animated: true)
+        CATransaction.commit()
+
+        clockwiseLayer.add(rotationAnimation(from: 0, to: .pi * 2), forKey: "spin")
+        counterclockwiseLayer.add(rotationAnimation(from: 0, to: -.pi * 2), forKey: "spin")
+        centerLayer.add(pulseAnimation(from: 0.3, to: 0.9, duration: 1.4), forKey: "pulse")
+        clockwiseVerticesLayer.add(pulseAnimation(from: 0.6, to: 1, duration: 1), forKey: "pulse")
+        counterclockwiseVerticesLayer.add(pulseAnimation(from: 0.42, to: 0.7, duration: 1), forKey: "pulse")
+    }
+
+    private func retimeRotationAnimations() {
+        let clockwiseRotation = presentationRotation(of: clockwiseLayer)
+        let counterclockwiseRotation = presentationRotation(of: counterclockwiseLayer)
+
+        clockwiseLayer.add(
+            rotationAnimation(from: clockwiseRotation, to: clockwiseRotation + .pi * 2),
+            forKey: "spin"
+        )
+        counterclockwiseLayer.add(
+            rotationAnimation(from: counterclockwiseRotation, to: counterclockwiseRotation - .pi * 2),
+            forKey: "spin"
+        )
+    }
+
+    private func stopAnimations() {
+        removeAnimations()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        applyModelState(animated: false)
+        CATransaction.commit()
+    }
+
+    private func removeAnimations() {
+        for layer in [
+            clockwiseLayer,
+            counterclockwiseLayer,
+            centerLayer,
+            clockwiseVerticesLayer,
+            counterclockwiseVerticesLayer,
+        ] {
+            layer.removeAllAnimations()
+        }
+    }
+
+    private func presentationRotation(of layer: CALayer) -> CGFloat {
+        let transform = (layer.presentation() ?? layer).transform
+        return atan2(transform.m12, transform.m11)
+    }
+
+    private func rotationAnimation(from start: CGFloat, to end: CGFloat) -> CABasicAnimation {
+        let animation = CABasicAnimation(keyPath: "transform.rotation.z")
+        animation.fromValue = start
+        animation.toValue = end
+        animation.duration = revolutionDuration
+        animation.repeatCount = .infinity
+        animation.timingFunction = CAMediaTimingFunction(name: .linear)
+        return animation
+    }
+
+    private func pulseAnimation(from: Float, to: Float, duration: Double) -> CABasicAnimation {
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = from
+        animation.toValue = to
+        animation.duration = duration
+        animation.autoreverses = true
+        animation.repeatCount = .infinity
+        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        return animation
+    }
+}
+
+// MARK: - Merkaba Dissipate (No-Speech Terminal)
+
+/// Merkaba wind-down for the "no speech detected" terminal state.
+/// The sacred geometry settles, dissolves, and fades — leaving space for
+/// an external text label to materialize over the top.
+///
+/// Sequence:
+///   Phase 1 — triangles slow and align into Star of David (stillness)
+///   Phase 2 — strokes and vertices dissolve
+///   Phase 3 — center nexus exhales and fades last
+struct MerkabaDissipateView: View {
+    var size: CGFloat = 26
+    var tintColor: Color = .white
+
+    /// Phase 1: triangles slow-rotate and align to Star of David
+    @State private var settled = false
+    /// Phase 2: strokes and vertex glow dissolve
+    @State private var dissolved = false
+    /// Phase 3: center nexus contracts and fades
+    @State private var exhaled = false
+
+    private var radius: CGFloat { size * 0.423 }
+
+    var body: some View {
+        ZStack {
+            // Outer guide ring
+            Circle()
+                .stroke(tintColor.opacity(dissolved ? 0 : 0.05), lineWidth: 0.5)
+                .frame(width: size, height: size)
+
+            // Triangle 1 — settles to 0° (upward-pointing)
+            triangleLayer(
+                rotation: settled ? 0 : 20,
+                strokeOpacity: dissolved ? 0 : 0.35,
+                vertexOpacity: dissolved ? 0 : 0.6
+            )
+
+            // Triangle 2 — settles to 60° (downward, forming Star of David)
+            triangleLayer(
+                rotation: settled ? 60 : 40,
+                strokeOpacity: dissolved ? 0 : 0.2,
+                vertexOpacity: dissolved ? 0 : 0.42
+            )
+
+            // Center nexus — last point of light before text takes over
+            Circle()
+                .fill(tintColor.opacity(exhaled ? 0 : 0.6))
+                .frame(width: size * 0.115, height: size * 0.115)
+                .shadow(color: tintColor.opacity(exhaled ? 0 : 0.3), radius: size * 0.154)
+                .scaleEffect(exhaled ? 0.3 : 1.0)
+        }
+        .frame(width: size, height: size)
+        .scaleEffect(settled ? 0.85 : 1.0)
+        .drawingGroup()
+        .onAppear {
+            // Reset to baseline so repeated presentations replay deterministically.
+            settled = false
+            dissolved = false
+            exhaled = false
+
+            // Phase 1: settle into Star of David alignment
+            withAnimation(.easeOut(duration: NoSpeechAnimationTiming.merkabaSettleDuration)) {
+                settled = true
+            }
+            // Phase 2: dissolve triangles and vertices
+            withAnimation(
+                .easeOut(duration: NoSpeechAnimationTiming.merkabaDissolveDuration)
+                    .delay(NoSpeechAnimationTiming.merkabaDissolveDelay)
+            ) {
+                dissolved = true
+            }
+            // Phase 3: center nexus exhales
+            withAnimation(
+                .easeOut(duration: NoSpeechAnimationTiming.merkabaExhaleDuration)
+                    .delay(NoSpeechAnimationTiming.merkabaExhaleDelay)
+            ) {
+                exhaled = true
+            }
+        }
+    }
+
+    private func triangleLayer(rotation: Double, strokeOpacity: Double, vertexOpacity: Double) -> some View {
+        ZStack {
+            TriangleShape()
+                .stroke(tintColor.opacity(strokeOpacity), lineWidth: 0.8)
+                .frame(width: radius * 2, height: radius * 2)
+
+            ForEach(0..<3, id: \.self) { i in
+                let angle = (Double(i) * 120.0 - 90.0) * .pi / 180.0
+                let x = Foundation.cos(angle) * radius
+                let y = Foundation.sin(angle) * radius
+
+                Circle()
+                    .fill(tintColor.opacity(vertexOpacity))
+                    .frame(width: size * 0.096, height: size * 0.096)
+                    .shadow(color: tintColor.opacity(vertexOpacity * 0.4), radius: size * 0.115)
+                    .offset(x: x, y: y)
+            }
+        }
+        .rotationEffect(.degrees(rotation))
+    }
+}
+
+// MARK: - Breathing Ring (Ready / Waiting)
+
+/// Gentle breath indicator for the dictation overlay's ephemeral `.ready`
+/// state — shown briefly (~800ms) while dictation waits for a gesture to
+/// become active. A soft white ring inhales around a warm coral nexus: the
+/// smallest, lightest member of the sacred-geometry family, signalling
+/// "listening, poised, waiting" without competing with the active Merkaba
+/// (processing) or the dissolving Merkaba (no speech).
+///
+/// ## Motion
+/// A single intentional inhale — **not** a perpetual loop. The pill is
+/// typically visible for ~800ms, which is shorter than any natural breath
+/// cycle; a `repeatForever` animation would be cut off mid-rise and read as
+/// clipped rather than alive. Instead, ring and nexus bloom from rest to
+/// peak via a soft, near-critically-damped spring (~700ms) and then hold
+/// at peak until the pill dismisses. The entire visible duration reads as
+/// one elegant rise — drawing breath in and holding — with no risk of
+/// clipping.
+///
+/// ## Color hierarchy
+/// The ring is white (belongs to the Merkaba family), but the nexus uses
+/// `DesignSystem.Colors.accent` (coral-orange — MacParakeet's brand
+/// attention color). The coral glow bleeds out past the ring into the dark
+/// pill background, creating luminous depth. This is the only dictation
+/// overlay state that uses the brand accent: **`.ready` is "MacParakeet
+/// listening for you."**
+///
+/// ## Accessibility
+/// Honors `Reduce Motion` by presenting the peak state statically (no
+/// inhale animation, just the fully-bloomed ring + nexus). Exposed to
+/// VoiceOver as "Ready to record" — `.ready` is a poised pause, not an
+/// engaged mic, so we deliberately avoid "Listening".
+struct BreathingRingView: View {
+    var size: CGFloat = 18
+    var ringColor: Color = .white
+    var nexusColor: Color = DesignSystem.Colors.accent
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    /// 0 = rest, 1 = peak. One-shot: animates from 0 → 1 on appear via a
+    /// soft spring and then holds at 1 until the view disappears. Never
+    /// loops — the pill's brief visibility window is too short for a full
+    /// cycle to read cleanly, so a single intentional bloom is more honest.
+    @State private var breath: CGFloat = 0
+
+    var body: some View {
+        ZStack {
+            // White breathing ring — the halo of attention, sibling to the
+            // Merkaba family. Stroke opacity carries the primary breath
+            // signal; a subtle scale adds organic lift without visibly
+            // changing stroke weight.
+            Circle()
+                .stroke(ringColor.opacity(0.30 + 0.40 * Double(breath)), lineWidth: 0.9)
+                .frame(width: size, height: size)
+                .scaleEffect(0.88 + 0.14 * breath)
+
+            // Warm coral nexus — the heart of attention. Scales, brightens,
+            // and emits a coral glow that bleeds out past the ring to give
+            // the pill luminous depth on its dark background.
+            Circle()
+                .fill(nexusColor.opacity(0.55 + 0.40 * Double(breath)))
+                .frame(width: size * 0.18, height: size * 0.18)
+                .scaleEffect(0.80 + 0.25 * breath)
+                .shadow(color: nexusColor.opacity(0.50 * Double(breath)), radius: size * 0.22)
+        }
+        .frame(width: size, height: size)
+        .accessibilityElement()
+        .accessibilityLabel("Ready to record")
+        .onAppear {
+            // Reduce Motion: skip the inhale, present at peak statically.
+            // The user still sees the fully-bloomed state — they just don't
+            // see it move.
+            guard !reduceMotion else {
+                breath = 1
+                return
+            }
+
+            // One-shot inhale. Near-critically-damped spring
+            // (dampingFraction 0.95) for a soft, organic arrival — a
+            // whisper of warmth with a sub-perceptible overshoot. Response
+            // 0.70 gives ~700ms bloom, leaving ~100ms of hold at peak
+            // before the pill typically dismisses.
+            withAnimation(.spring(response: 0.70, dampingFraction: 0.95)) {
+                breath = 1
+            }
+        }
+    }
+}
+
+// MARK: - Meditative Merkaba (Large, Slow)
+
+/// Larger, slower merkaba for empty states and idle backgrounds.
+/// Softer opacity, adapts to light/dark mode via `.primary`.
+///
+/// Animates by default (two counter-rotating triangles). Pass `animate: false`
+/// for purely static decoration. Purely decorative — hidden from VoiceOver.
+///
+/// ## Performance
+/// Only the rotations animate — the center/vertex glow opacities are static.
+/// No `.drawingGroup()` on the animating path: `.drawingGroup()` flattens
+/// the subtree into an offscreen bitmap that CA must regenerate whenever
+/// any child value changes (including transforms), which is incompatible
+/// with animated sub-content. Without it, CA composites each stroked
+/// triangle + vertex circle as its own layer; `.rotationEffect()` updates
+/// the layer's transform per frame, which is GPU-cheap.
+///
+/// **Note:** SwiftUI's `withAnimation` on `@State` still re-evaluates the
+/// view body at display-link rate — it is NOT a pure `CABasicAnimation`
+/// handoff to the render server. Expect single-digit-to-low-teens CPU on a
+/// visible window while spinning. Moving to `NSViewRepresentable` wrapping
+/// an explicit `CABasicAnimation(keyPath: "transform.rotation.z")` would
+/// drop window-visible CPU further, and is tracked as future work.
+///
+/// See PR #107 (idle CPU/GPU fix) for the counter-example: 4 `repeatForever`
+/// animations + `.drawingGroup()` forced Metal to re-rasterize the flattened
+/// bitmap every frame, burning ~15-18% CPU at idle. Freezing the opacity
+/// pulses AND removing the drawing group drops *closed-window* idle cost to
+/// 0% while restoring the hero spin.
+struct MeditativeMerkabaView: View {
+    var size: CGFloat = 64
+    var revolutionDuration: Double = 6.0
+    var tintColor: Color? = nil
+    var animate: Bool = true
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    @State private var rotationCW: Double = 0
+    @State private var rotationCCW: Double = 60
+
+    private var effectiveColor: Color { tintColor ?? .primary }
+    private var radius: CGFloat { size * 0.4 }
+    private var shouldAnimate: Bool { animate && !reduceMotion }
+
+    // Static glow values — formerly animated as centerPulse/vertexPulse.
+    // Mid-cycle values chosen so the resting merkaba matches the visual
+    // weight of the previous animated peak/trough average.
+    private let centerGlow: Double = 0.32
+    private let vertexGlow: Double = 0.45
+
+    var body: some View {
+        ZStack {
+            // Outer guide ring
+            Circle()
+                .stroke(effectiveColor.opacity(0.06), lineWidth: 0.5)
+                .frame(width: size, height: size)
+
+            // Triangle 1 — clockwise. `rotationEffect` animates via CA
+            // transform on the triangle's CALayer; body re-evaluations
+            // between animation start and end are rare.
+            meditativeTriangle(strokeOpacity: 0.25, vertexOpacity: vertexGlow)
+                .rotationEffect(.degrees(rotationCW))
+
+            // Triangle 2 — counter-clockwise (offset 60° for Star of David)
+            meditativeTriangle(strokeOpacity: 0.15, vertexOpacity: vertexGlow * 0.6)
+                .rotationEffect(.degrees(rotationCCW))
+
+            // Center nexus — static glow, shadow for halo
+            Circle()
+                .fill(effectiveColor.opacity(centerGlow * 1.5))
+                .frame(width: size * 0.06, height: size * 0.06)
+                .shadow(color: effectiveColor.opacity(centerGlow * 0.4), radius: size * 0.12)
+        }
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
+        .onAppear {
+            if shouldAnimate {
+                startAnimation()
+            }
+        }
+        .onChange(of: shouldAnimate) { _, newValue in
+            if newValue {
+                startAnimation()
+            } else {
+                stopAnimation()
+            }
+        }
+    }
+
+    private func startAnimation() {
+        withAnimation(.linear(duration: revolutionDuration).repeatForever(autoreverses: false)) {
+            rotationCW = 360
+        }
+        withAnimation(.linear(duration: revolutionDuration).repeatForever(autoreverses: false)) {
+            rotationCCW = 60 - 360
+        }
+    }
+
+    private func stopAnimation() {
+        withAnimation(.linear(duration: 0)) {
+            rotationCW = 0
+            rotationCCW = 60
+        }
+    }
+
+    private func meditativeTriangle(strokeOpacity: Double, vertexOpacity: Double) -> some View {
+        ZStack {
+            TriangleShape()
+                .stroke(effectiveColor.opacity(strokeOpacity), lineWidth: size > 80 ? 1.0 : 0.8)
+                .frame(width: radius * 2, height: radius * 2)
+
+            ForEach(0..<3, id: \.self) { i in
+                let angle = (Double(i) * 120.0 - 90.0) * .pi / 180.0
+                let x = Foundation.cos(angle) * radius
+                let y = Foundation.sin(angle) * radius
+
+                Circle()
+                    .fill(effectiveColor.opacity(vertexOpacity))
+                    .frame(width: size * 0.07, height: size * 0.07)
+                    .shadow(color: effectiveColor.opacity(vertexOpacity * 0.4), radius: size * 0.06)
+                    .offset(x: x, y: y)
+            }
+        }
+    }
+}
+
+// MARK: - Sacred Geometry Divider
+
+/// Thin line with centered diamond ornament (two tiny triangles point-to-point).
+/// Warm coral tint on the diamond for personality.
+struct SacredGeometryDivider: View {
+    var body: some View {
+        HStack(spacing: 0) {
+            line
+            diamond
+            line
+        }
+        .frame(height: 12)
+    }
+
+    private var line: some View {
+        Rectangle()
+            .fill(DesignSystem.Colors.border)
+            .frame(height: 0.5)
+    }
+
+    private var diamond: some View {
+        Canvas { context, size in
+            let mid = CGPoint(x: size.width / 2, y: size.height / 2)
+            let hw: CGFloat = 4
+            let hh: CGFloat = 6
+
+            var path = Path()
+            path.move(to: CGPoint(x: mid.x, y: mid.y - hh))
+            path.addLine(to: CGPoint(x: mid.x + hw, y: mid.y))
+            path.addLine(to: CGPoint(x: mid.x, y: mid.y + hh))
+            path.addLine(to: CGPoint(x: mid.x - hw, y: mid.y))
+            path.closeSubpath()
+
+            context.stroke(path, with: .color(DesignSystem.Colors.accent.opacity(0.3)), lineWidth: 0.8)
+        }
+        .frame(width: 16, height: 12)
+    }
+}
