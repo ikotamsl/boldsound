@@ -879,7 +879,7 @@ final class LLMClientTests: XCTestCase {
         XCTAssertNil(capturedBody?["temperature"])
     }
 
-    func testGPT5UsesMaxCompletionTokensButKeepsTemperature() async throws {
+    func testGPT5BuildsSupportedParameterSchemaDynamically() async throws {
         var capturedBody: [String: Any]?
 
         MockURLProtocol.handler = { request in
@@ -889,7 +889,7 @@ final class LLMClientTests: XCTestCase {
             return (self.okResponse(for: request), self.validResponseData())
         }
 
-        let config = LLMProviderConfig.openai(apiKey: "sk-test", model: "gpt-5.2")
+        let config = LLMProviderConfig.openai(apiKey: "sk-test", model: "gpt-5.5")
         _ = try await llmClient.chatCompletion(
             messages: [ChatMessage(role: .user, content: "Hi")],
             config: config,
@@ -899,7 +899,30 @@ final class LLMClientTests: XCTestCase {
         // GPT-5.x requires max_completion_tokens, not max_tokens
         XCTAssertNil(capturedBody?["max_tokens"])
         XCTAssertEqual(capturedBody?["max_completion_tokens"] as? Int, 500)
-        // But GPT-5.x still accepts temperature (unlike reasoning models)
+        // GPT-5 reasoning models only accept the default temperature. Omitting
+        // the app-wide 0.7 value lets OpenAI apply that default.
+        XCTAssertNil(capturedBody?["temperature"])
+    }
+
+    func testGPT5ChatModelRetainsSamplingParameters() async throws {
+        var capturedBody: [String: Any]?
+
+        MockURLProtocol.handler = { request in
+            if let body = self.extractBody(from: request) {
+                capturedBody = body
+            }
+            return (self.okResponse(for: request), self.validResponseData())
+        }
+
+        let config = LLMProviderConfig.openai(apiKey: "sk-test", model: "gpt-5.3-chat-latest")
+        _ = try await llmClient.chatCompletion(
+            messages: [ChatMessage(role: .user, content: "Hi")],
+            config: config,
+            options: ChatCompletionOptions(temperature: 0.7, maxTokens: 500)
+        )
+
+        XCTAssertNil(capturedBody?["max_tokens"])
+        XCTAssertEqual(capturedBody?["max_completion_tokens"] as? Int, 500)
         XCTAssertEqual(capturedBody?["temperature"] as? Double, 0.7)
     }
 

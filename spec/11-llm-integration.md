@@ -154,6 +154,13 @@ public struct ChatCompletionOptions: Sendable {
     public let maxTokens: Int?
 }
 
+The OpenAI-compatible transport derives its wire-parameter schema from the
+selected provider and model for each request. Native OpenAI reasoning models
+omit custom `temperature` when the model only accepts its default and use
+`max_completion_tokens` where required; other compatible providers keep the
+generic `temperature` and `max_tokens` shape even when their model IDs resemble
+OpenAI IDs.
+
 public struct ChatCompletionResponse: Sendable {
     public let content: String
     public let reasoningContent: String?

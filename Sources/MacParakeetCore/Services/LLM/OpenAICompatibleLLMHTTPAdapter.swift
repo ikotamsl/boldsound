@@ -209,14 +209,16 @@ struct OpenAICompatibleLLMHTTPAdapter: LLMHTTPAdapter {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
 
-        // OpenAI reasoning models reject temperature AND max_tokens.
-        // Newer OpenAI models (gpt-5.x) reject max_tokens but accept temperature.
-        // All of them require max_completion_tokens instead of max_tokens.
-        let isReasoningModel = config.id == .openai && Self.isOpenAIReasoningModel(config.modelName)
-        let needsNewTokenParam = config.id == .openai && Self.openAIRequiresMaxCompletionTokens(config.modelName)
-        let temperature = isReasoningModel ? nil : options.temperature
-        let maxTokens = needsNewTokenParam ? nil : options.maxTokens
-        let maxCompletionTokens = needsNewTokenParam ? options.maxTokens : nil
+        // Chat Completions exposes one broad request shape, but individual
+        // OpenAI model families accept different subsets of it. Resolve that
+        // shape from the selected provider and model for every request so a
+        // newly selected model cannot inherit incompatible parameters from a
+        // previous one.
+        let parameterSchema = Self.parameterSchema(for: config)
+        let temperature = parameterSchema.supportsCustomTemperature ? options.temperature : nil
+        let maxTokens = parameterSchema.tokenLimitParameter == .maxTokens ? options.maxTokens : nil
+        let maxCompletionTokens =
+            parameterSchema.tokenLimitParameter == .maxCompletionTokens ? options.maxTokens : nil
 
         // Ollama defaults to 2048-token context regardless of model capability.
         // Inject num_ctx to use the model's actual context window.
@@ -247,12 +249,53 @@ struct OpenAICompatibleLLMHTTPAdapter: LLMHTTPAdapter {
         isOpenAIReasoningModelID(model.lowercased())
     }
 
+    /// The request parameter subset supported by the selected model.
+    ///
+    /// OpenAI-compatible providers retain the generic Chat Completions shape:
+    /// their model names may resemble OpenAI model IDs without sharing the
+    /// same wire-level restrictions.
+    struct ParameterSchema: Equatable {
+        enum TokenLimitParameter: Equatable {
+            case maxTokens
+            case maxCompletionTokens
+        }
+
+        let supportsCustomTemperature: Bool
+        let tokenLimitParameter: TokenLimitParameter
+    }
+
+    static func parameterSchema(for config: LLMProviderConfig) -> ParameterSchema {
+        guard config.id == .openai else {
+            return ParameterSchema(
+                supportsCustomTemperature: true,
+                tokenLimitParameter: .maxTokens
+            )
+        }
+
+        let model = config.modelName.lowercased()
+        let isReasoningModel = isOpenAIReasoningModelID(model)
+        let isGPT5Model =
+            isGPT5ModelID(model)
+            && !model.hasPrefix("gpt-5-chat")
+            && !model.contains("-chat-latest")
+
+        return ParameterSchema(
+            // o-series and GPT-5 reasoning models only accept the default
+            // temperature in Chat Completions. Omitting the field selects that
+            // default and avoids sending the app-wide 0.7 value.
+            supportsCustomTemperature: !isReasoningModel && !isGPT5Model,
+            tokenLimitParameter: openAIRequiresMaxCompletionTokens(model)
+                ? .maxCompletionTokens
+                : .maxTokens
+        )
+    }
+
     /// OpenAI models that require max_completion_tokens instead of max_tokens.
     /// Includes reasoning models and newer GPT models (5.x+).
     static func openAIRequiresMaxCompletionTokens(_ model: String) -> Bool {
         let lowered = model.lowercased()
         if isOpenAIReasoningModel(lowered) { return true }
-        // GPT-5.x and beyond reject max_tokens
+        // GPT-5.x and beyond reject max_tokens.
         if lowered.hasPrefix("gpt-"), let digit = lowered.dropFirst(4).first, let version = digit.wholeNumberValue, version >= 5 {
             return true
         }
@@ -264,6 +307,10 @@ struct OpenAICompatibleLLMHTTPAdapter: LLMHTTPAdapter {
         let suffix = model.dropFirst()
         guard let generation = suffix.first, generation.isNumber else { return false }
         return hasOpenAIModelPrefix(model, prefix: "o\(generation)")
+    }
+
+    static func isGPT5ModelID(_ model: String) -> Bool {
+        model == "gpt-5" || model.hasPrefix("gpt-5.") || model.hasPrefix("gpt-5-")
     }
 
     static func hasOpenAIModelPrefix(_ model: String, prefix: String) -> Bool {
