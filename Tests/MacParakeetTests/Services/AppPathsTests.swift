@@ -4,13 +4,15 @@ import FluidAudio
 
 final class AppPathsTests: XCTestCase {
 
-    func testAppSupportDirContainsMacParakeet() {
-        XCTAssertTrue(AppPaths.appSupportDir.hasSuffix("MacParakeet"))
+    func testDefaultAppSupportDirUsesBoldSound() {
+        XCTAssertTrue(AppPaths.resolvedAppSupportDir(environment: [:]).hasSuffix("/BoldSound"))
     }
 
     func testDatabasePathIsInsideAppSupport() {
-        XCTAssertTrue(AppPaths.databasePath.hasPrefix(AppPaths.appSupportDir))
-        XCTAssertTrue(AppPaths.databasePath.hasSuffix("macparakeet.db"))
+        XCTAssertEqual(
+            AppPaths.databasePath,
+            URL(fileURLWithPath: AppPaths.appSupportDir).appendingPathComponent("boldsound.db").path
+        )
     }
 
     func testDictationsDirIsInsideAppSupport() {
@@ -117,11 +119,11 @@ final class AppPathsTests: XCTestCase {
 
     func testLogsDirIsInsideUserLogs() {
         XCTAssertTrue(AppPaths.logsDir.contains("Library/Logs"))
-        XCTAssertTrue(AppPaths.logsDir.hasSuffix("MacParakeet"))
+        XCTAssertTrue(AppPaths.logsDir.hasSuffix("/Logs/BoldSound"))
     }
 
-    func testTempDirContainsMacParakeet() {
-        XCTAssertTrue(AppPaths.tempDir.contains("macparakeet"))
+    func testTempDirUsesBoldSound() {
+        XCTAssertEqual(URL(fileURLWithPath: AppPaths.tempDir).lastPathComponent, "boldsound")
     }
 
     func testEnsureDirectoriesCreatesAll() throws {
