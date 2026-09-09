@@ -48,6 +48,77 @@ final class LLMHTTPAdapterTests: XCTestCase {
         AdapterRequestURLProtocol.handler = nil
     }
 
+    func testModernOpenAIModelsOmitTemperatureOnWire() async throws {
+        var capturedBody: [String: Any]?
+        AdapterRequestURLProtocol.handler = { request in
+            let data = try XCTUnwrap(self.bodyData(from: request))
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            capturedBody = body
+            if body["stream"] as? Bool == true {
+                let events = "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\ndata: [DONE]\n\n"
+                return (self.okResponse(for: request), Data(events.utf8))
+            }
+            return (self.okResponse(for: request), self.validOpenAIResponseData())
+        }
+
+        for model in [
+            "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5-2025-08-07",
+            "gpt-5-mini-2025-08-07", "gpt-5-nano-2025-08-07", "gpt-5.2-2025-12-11",
+            "gpt-5-chat", "gpt-5-chat-latest", "gpt-5.3-chat-latest", "gpt-5.5",
+            "gpt-6", "gpt-6-astra", "gpt-6-chat-latest", "GPT-5.3-chat-latest", "o3-mini",
+        ] {
+            for streaming in [false, true] {
+                capturedBody = nil
+                let config = LLMProviderConfig.openai(apiKey: "sk-test", model: model)
+                let options = ChatCompletionOptions(temperature: 0.2, maxTokens: 123)
+                if streaming {
+                    let chunks = try await collect(
+                        openAIAdapter.chatCompletionStream(
+                            messages: goldenMessages, config: config, options: options
+                        ))
+                    XCTAssertEqual(chunks, ["OK"], model)
+                } else {
+                    _ = try await openAIAdapter.chatCompletion(
+                        messages: goldenMessages, config: config, options: options
+                    )
+                }
+                let body = try XCTUnwrap(capturedBody)
+                let context = "\(model), stream=\(streaming)"
+                XCTAssertNil(body["temperature"], context)
+                XCTAssertNil(body["max_tokens"], context)
+                XCTAssertEqual(body["max_completion_tokens"] as? Int, 123, context)
+                XCTAssertEqual(body["stream"] as? Bool, streaming, context)
+                XCTAssertEqual(body["model"] as? String, model, context)
+            }
+        }
+    }
+
+    func testLegacyAndCompatibleRequestsRetainTemperatureInBothModes() throws {
+        for config in [
+            LLMProviderConfig.openai(apiKey: "sk-test", model: "gpt-4o"),
+            .openaiCompatible(
+                model: "gpt-5.3-chat-latest",
+                baseURL: URL(string: "https://custom.example.test/v1")!
+            ),
+        ] {
+            for streaming in [false, true] {
+                let request = try openAIAdapter.buildRequest(
+                    messages: goldenMessages,
+                    config: config,
+                    options: ChatCompletionOptions(temperature: 0.2, maxTokens: 123),
+                    stream: streaming
+                )
+                let data = try XCTUnwrap(bodyData(from: request))
+                let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+                let context = "\(config.id), \(config.modelName), stream=\(streaming)"
+                XCTAssertEqual(body["temperature"] as? Double, 0.2, context)
+                XCTAssertEqual(body["max_tokens"] as? Int, 123, context)
+                XCTAssertNil(body["max_completion_tokens"], context)
+                XCTAssertEqual(body["stream"] as? Bool, streaming, context)
+            }
+        }
+    }
+
     func testOpenAICompatibleAdapterBuildsGoldenRequest() async throws {
         var capturedRequest: URLRequest?
 
