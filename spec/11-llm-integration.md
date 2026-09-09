@@ -64,6 +64,21 @@ Streaming is provider-specific under the hood:
 
 The service boundary stays stable even though the transport is mixed.
 
+For the OpenAI provider (`config.id == .openai`), GPT-5 and newer models
+(including mini/nano variants, dated versions, and chat aliases such as
+`gpt-5-chat-latest` and `gpt-5.3-chat-latest`) and o-series models omit
+`temperature` entirely, allowing API sampling defaults rather than forcing `1`.
+This is the adapter's conservative policy: parameter support can depend on the
+model and reasoning settings, which the adapter does not configure. See the
+[official OpenAI model guide](https://developers.openai.com/api/docs/guides/latest-model).
+
+Temperature support is resolved independently of the token-limit parameter;
+these models continue to use `max_completion_tokens`. The shared `buildRequest`
+applies the policy to both ordinary and streaming requests. Older GPT models
+retain custom temperature and `max_tokens`; other OpenAI-compatible providers
+retain generic request parameters even for matching model IDs. Global options
+and the temperatures requested by `LLMService` remain unchanged.
+
 ### Supported Providers
 
 | Provider | Type | Default Base URL | Auth |
@@ -155,8 +170,8 @@ public struct ChatCompletionOptions: Sendable {
 }
 
 The OpenAI-compatible transport derives its wire-parameter schema from the
-selected provider and model for each request. Native OpenAI reasoning models
-omit custom `temperature` when the model only accepts its default and use
+selected provider and model for each request. OpenAI GPT-5+ (including chat
+aliases) and o-series models omit `temperature` under the policy above and use
 `max_completion_tokens` where required; other compatible providers keep the
 generic `temperature` and `max_tokens` shape even when their model IDs resemble
 OpenAI IDs.

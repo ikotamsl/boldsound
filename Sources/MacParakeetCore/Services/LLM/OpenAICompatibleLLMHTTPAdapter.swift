@@ -273,21 +273,30 @@ struct OpenAICompatibleLLMHTTPAdapter: LLMHTTPAdapter {
         }
 
         let model = config.modelName.lowercased()
-        let isReasoningModel = isOpenAIReasoningModelID(model)
-        let isGPT5Model =
-            isGPT5ModelID(model)
-            && !model.hasPrefix("gpt-5-chat")
-            && !model.contains("-chat-latest")
-
         return ParameterSchema(
-            // o-series and GPT-5 reasoning models only accept the default
-            // temperature in Chat Completions. Omitting the field selects that
-            // default and avoids sending the app-wide 0.7 value.
-            supportsCustomTemperature: !isReasoningModel && !isGPT5Model,
+            // Use the provider default for GPT-5+ (including chat aliases) and
+            // o-series models. Custom sampling support depends on reasoning
+            // settings that this adapter does not configure.
+            supportsCustomTemperature: openAISupportsCustomTemperature(model),
             tokenLimitParameter: openAIRequiresMaxCompletionTokens(model)
                 ? .maxCompletionTokens
                 : .maxTokens
         )
+    }
+
+    /// Sampling policy is independent of the token-limit parameter capability.
+    static func openAISupportsCustomTemperature(_ model: String) -> Bool {
+        let lowered = model.lowercased()
+        return !isOpenAIReasoningModelID(lowered) && !isGPT5OrNewerModelID(lowered)
+    }
+
+    static func isGPT5OrNewerModelID(_ model: String) -> Bool {
+        guard model.hasPrefix("gpt-") else { return false }
+        let suffix = model.dropFirst(4)
+        let digits = suffix.prefix(while: { $0.isNumber })
+        guard let generation = Int(digits), generation >= 5 else { return false }
+        let boundary = suffix.dropFirst(digits.count).first
+        return boundary == nil || boundary == "." || boundary == "-"
     }
 
     /// OpenAI models that require max_completion_tokens instead of max_tokens.
@@ -307,10 +316,6 @@ struct OpenAICompatibleLLMHTTPAdapter: LLMHTTPAdapter {
         let suffix = model.dropFirst()
         guard let generation = suffix.first, generation.isNumber else { return false }
         return hasOpenAIModelPrefix(model, prefix: "o\(generation)")
-    }
-
-    static func isGPT5ModelID(_ model: String) -> Bool {
-        model == "gpt-5" || model.hasPrefix("gpt-5.") || model.hasPrefix("gpt-5-")
     }
 
     static func hasOpenAIModelPrefix(_ model: String, prefix: String) -> Bool {

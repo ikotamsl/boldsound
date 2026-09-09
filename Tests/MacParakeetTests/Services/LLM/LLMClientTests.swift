@@ -899,12 +899,11 @@ final class LLMClientTests: XCTestCase {
         // GPT-5.x requires max_completion_tokens, not max_tokens
         XCTAssertNil(capturedBody?["max_tokens"])
         XCTAssertEqual(capturedBody?["max_completion_tokens"] as? Int, 500)
-        // GPT-5 reasoning models only accept the default temperature. Omitting
-        // the app-wide 0.7 value lets OpenAI apply that default.
+        // GPT-5+ uses API sampling defaults regardless of chat/reasoning alias.
         XCTAssertNil(capturedBody?["temperature"])
     }
 
-    func testGPT5ChatModelRetainsSamplingParameters() async throws {
+    func testGPT5ChatModelOmitsTemperature() async throws {
         var capturedBody: [String: Any]?
 
         MockURLProtocol.handler = { request in
@@ -923,7 +922,7 @@ final class LLMClientTests: XCTestCase {
 
         XCTAssertNil(capturedBody?["max_tokens"])
         XCTAssertEqual(capturedBody?["max_completion_tokens"] as? Int, 500)
-        XCTAssertEqual(capturedBody?["temperature"] as? Double, 0.7)
+        XCTAssertNil(capturedBody?["temperature"])
     }
 
     func testNonReasoningModelUsesMaxTokens() async throws {
