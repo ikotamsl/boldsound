@@ -13,6 +13,7 @@ final class AppEnvironment {
     let databaseManager: DatabaseManager
     let dictationRepo: DictationRepository
     let transcriptionRepo: TranscriptionRepository
+    let meetingAgentService: MeetingAgentService
     let segmentRepo: SegmentRepository
     let cardRepo: CardRepository
     let knowledgeLayerMutator: KnowledgeLayerMutationService
@@ -66,7 +67,8 @@ final class AppEnvironment {
 
         // Repositories
         dictationRepo = DictationRepository(dbQueue: databaseManager.dbQueue)
-        transcriptionRepo = TranscriptionRepository(dbQueue: databaseManager.dbQueue)
+        transcriptionRepo = TranscriptionRepository(dbQueue: databaseManager.dbQueue, meetingAgentConfiguration: { .current() })
+        meetingAgentService = MeetingAgentService(dbQueue: databaseManager.dbQueue)
         segmentRepo = SegmentRepository(dbQueue: databaseManager.dbQueue)
         cardRepo = CardRepository(dbQueue: databaseManager.dbQueue)
         knowledgeLayerMutator = KnowledgeLayerMutationService(dbQueue: databaseManager.dbQueue)

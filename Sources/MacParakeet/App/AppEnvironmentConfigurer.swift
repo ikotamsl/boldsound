@@ -96,6 +96,7 @@ final class AppEnvironmentConfigurer {
     }
 
     func configure(environment env: AppEnvironment, callbacks: Callbacks) -> Runtime {
+        MeetingAgentViewModel.shared.configure(service: env.meetingAgentService)
         Task {
             // Only bootstrap trial if onboarding is already completed (returning user).
             // For new users, trial starts at onboarding completion, not during setup.

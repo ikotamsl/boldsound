@@ -395,6 +395,7 @@ struct SettingsView: View {
                 case .meetings:
                     if AppFeatures.meetingRecordingEnabled {
                         meetingRecordingCard.id("meeting")
+                        MeetingAgentSettingsView().id("meeting-agent")
                     }
                 }
             }

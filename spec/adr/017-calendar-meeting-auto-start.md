@@ -236,3 +236,25 @@ Repo: `https://github.com/moona3k/oatmeal` (same owner, GPL-3.0).
 - **Naming in copy**: "Auto-start" vs "Auto-record" vs "Start automatically" — pick one and use it everywhere.
 - **Countdown with LLM features**: should insights (ADR-018) begin warming up during the countdown so the first live insight lands sooner? Or wait until recording actually starts? Lean towards wait — zero-second "ghost warm-up" is complexity we don't need until measurements justify it.
 - **Onboarding ordering**: before or after the STT model download? Leaning *before* so the user isn't asked to click through after a 60-second wait.
+
+## 2026-09-10 amendment: explicit meeting-agent context
+
+The optional Obsidian meeting agent adds manual EventKit selection before,
+during and after recording. `CalendarService.searchEvents(from:to:query:)`
+returns past/future events without auto-start filters (including declined and
+all-day events); a manual selection never starts/stops recording by itself.
+No second calendar authorization is requested by Python.
+
+Original recording snapshots remain in `transcriptions.calendarEventSnapshot`.
+Later manual selections and note references are versioned separately in
+`meeting_agent_bindings`; future-event note links use occurrence identity
+(event identifier plus scheduled start). Note selection and calendar selection
+are independent. Recording-session bindings transfer to the distinct persisted
+transcription UUID transactionally, including recovered session folders.
+
+Opt-in automation may send the effective calendar snapshot and transcript to
+the explicitly selected cloud profile; local mode keeps inference on the
+configured local server. This is a separate consent/configuration surface and
+does not change calendar polling, external hooks or other AI providers. The
+app outbox and agent worker revalidate changes before writing notes. See
+[meeting-agent v1](../contracts/meeting-agent-v1.md) for the complete boundary.

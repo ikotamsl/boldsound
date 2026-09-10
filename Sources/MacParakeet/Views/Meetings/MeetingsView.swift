@@ -29,6 +29,7 @@ struct MeetingsView: View {
                 VStack(alignment: .leading, spacing: DesignSystem.Spacing.lg) {
                     header
                     recordingSurface
+                    MeetingAgentControls()
                     contentColumns(
                         usesTwoColumnLayout: proxy.size.width >= Self.twoColumnMinimumWidth
                     )

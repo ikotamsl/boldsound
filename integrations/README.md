@@ -624,3 +624,9 @@ OpenClaw, Hermes, or another local agent framework.
 Open an issue at <https://github.com/moona3k/macparakeet/issues> with the
 `integration` label. Include the agent platform, the CLI version
 (`macparakeet-cli --version`), and a minimal repro.
+
+## Obsidian meeting agent
+
+See [obsidian/README.md](obsidian/README.md) for the opt-in meeting-only agent,
+connection profiles, durable worker, manual processing and safe managed notes.
+It uses its own app outbox and does not replace an external automation hook.

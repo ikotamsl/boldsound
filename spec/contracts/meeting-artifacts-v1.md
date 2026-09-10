@@ -223,3 +223,19 @@ after audio detach, and artifact-folder path preservation.
 
 Update this file, `spec/01-data-model.md`, `Sources/CLI/CHANGELOG.md` when CLI
 users are affected, and the focused XCTest coverage in the same PR.
+
+## Optional Obsidian meeting-agent consumer
+
+The built-in agent consumes completed meeting transcript snapshots through a
+separate durable app outbox and references `transcript.json` in Obsidian.
+It does not replace the existing `meeting.completed` hook. Delivery waits for
+canonical artifacts and never rewrites their sidecars, preserving prompt results,
+user notes and concurrent artifact updates. Original
+calendar snapshots in artifacts remain unchanged after manual integration
+binding edits; effective selections live in the integration tables/protocol.
+
+Obsidian notes use managed blocks and `macparakeet_ids` for multiple parts, with
+read compatibility for `macparakeet_id`. They link to local transcript artifacts
+without embedding their full text. Agent job/result files are kept in its
+private state directory, not added to the stable meeting artifact filenames.
+See [Meeting agent JSON v1](meeting-agent-v1.md) and `MeetingAgentTests`.
