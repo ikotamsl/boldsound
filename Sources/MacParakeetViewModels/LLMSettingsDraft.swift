@@ -4,6 +4,7 @@ import Network
 
 public struct LLMSettingsDraft: Equatable, Sendable {
     public enum ValidationError: LocalizedError, Equatable {
+        case unsupportedSubscription
         case missingAPIKey
         case missingModelSelection
         case missingCustomModel
@@ -13,6 +14,8 @@ public struct LLMSettingsDraft: Equatable, Sendable {
 
         public var errorDescription: String? {
             switch self {
+            case .unsupportedSubscription:
+                return "Subscription access is not supported for this provider."
             case .missingAPIKey:
                 return "Enter an API key."
             case .missingModelSelection:
@@ -29,6 +32,7 @@ public struct LLMSettingsDraft: Equatable, Sendable {
         }
     }
 
+    public var authenticationMode: LLMAuthenticationMode = .apiKey
     public var providerID: LLMProviderID?
     public var apiKeyInput: String
     public var suggestedModelName: String
@@ -70,11 +74,11 @@ public struct LLMSettingsDraft: Equatable, Sendable {
     }
 
     public var requiresAPIKey: Bool {
-        providerID?.requiresAPIKey ?? false
+        authenticationMode == .apiKey && (providerID?.requiresAPIKey ?? false)
     }
 
     public var supportsAPIKey: Bool {
-        providerID?.supportsAPIKey ?? false
+        authenticationMode == .apiKey && (providerID?.supportsAPIKey ?? false)
     }
 
     public var trimmedAPIKey: String {
@@ -107,6 +111,9 @@ public struct LLMSettingsDraft: Equatable, Sendable {
 
     private func validationError(allowMissingModelName: Bool) -> ValidationError? {
         guard let providerID else { return nil }
+        if authenticationMode == .subscription && !providerID.supportsSubscription {
+            return .unsupportedSubscription
+        }
         if providerID == .localCLI {
             return trimmedCommandTemplate.isEmpty ? .missingCommandTemplate : nil
         }
@@ -118,9 +125,11 @@ public struct LLMSettingsDraft: Equatable, Sendable {
                 return .missingCustomModel
             }
         } else if !allowMissingModelName
-                    && suggestedModelName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            && suggestedModelName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
             return .missingModelSelection
         }
+        if authenticationMode == .subscription { return nil }
         if providerID.requiresCustomEndpoint && trimmedBaseURLOverride.isEmpty {
             return .invalidBaseURL
         }
@@ -146,7 +155,8 @@ public struct LLMSettingsDraft: Equatable, Sendable {
     public var isLocalConfiguration: Bool {
         guard let providerID else { return false }
         if providerID == .openaiCompatible,
-           let url = URL(string: trimmedBaseURLOverride) {
+            let url = URL(string: trimmedBaseURLOverride)
+        {
             return Self.isOpenAICompatibleLocalConfiguration(
                 url,
                 allowInsecureLocalNetworkHTTP: allowInsecureLocalNetworkHTTP
@@ -157,8 +167,8 @@ public struct LLMSettingsDraft: Equatable, Sendable {
 
     public var usesInsecureLocalNetworkHTTP: Bool {
         guard providerID == .openaiCompatible,
-              allowInsecureLocalNetworkHTTP,
-              let url = URL(string: trimmedBaseURLOverride)
+            allowInsecureLocalNetworkHTTP,
+            let url = URL(string: trimmedBaseURLOverride)
         else {
             return false
         }
@@ -180,6 +190,12 @@ public struct LLMSettingsDraft: Equatable, Sendable {
 
         if providerID == .inProcessLocal {
             return .inProcessLocal(model: effectiveModelName)
+        }
+
+        if authenticationMode == .subscription {
+            return LLMProviderConfig(
+                id: providerID, baseURL: URL(string: providerID.defaultBaseURL)!, apiKey: nil,
+                modelName: effectiveModelName, isLocal: false, authenticationMode: .subscription)
         }
 
         let baseURL: URL
@@ -255,7 +271,7 @@ public struct LLMSettingsDraft: Equatable, Sendable {
     ) -> Self {
         let isSuggestedModel = suggestedModels.contains(config.modelName)
         let selectedCLITemplate = cliConfig.map { LocalCLITemplate.inferredTemplate(for: $0.commandTemplate) } ?? nil
-        return LLMSettingsDraft(
+        var draft = LLMSettingsDraft(
             providerID: config.id,
             apiKeyInput: config.apiKey ?? "",
             suggestedModelName: isSuggestedModel ? config.modelName : defaultModelName,
@@ -268,6 +284,8 @@ public struct LLMSettingsDraft: Equatable, Sendable {
             cliTimeoutSeconds: cliConfig?.timeoutSeconds ?? LocalCLIConfig.defaultTimeout,
             aiFormatterPrompt: aiFormatterPrompt
         )
+        draft.authenticationMode = config.authenticationMode
+        return draft
     }
 
     private static func baseURLValidationError(
@@ -276,7 +294,8 @@ public struct LLMSettingsDraft: Equatable, Sendable {
         allowInsecureLocalNetworkHTTP: Bool
     ) -> ValidationError? {
         guard let scheme = url.scheme?.lowercased(),
-              url.host != nil else {
+            url.host != nil
+        else {
             return .invalidBaseURL
         }
         if providerID == .inProcessLocal {

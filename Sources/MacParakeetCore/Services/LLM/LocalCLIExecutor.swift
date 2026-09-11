@@ -81,7 +81,8 @@ public enum LocalCLIError: Error, LocalizedError, Sendable {
         case .commandNotFound(let details):
             return "CLI command not found. Ensure it is installed and on your PATH. Details: \(details)"
         case .timeout(let seconds):
-            return "Timed out after \(Int(seconds))s. Verify the command runs successfully in a terminal and is logged in if required."
+            return
+                "Timed out after \(Int(seconds))s. Verify the command runs successfully in a terminal and is logged in if required."
         case .drainTimeout:
             return "CLI command exited, but its output pipes did not close in time."
         case .nonZeroExit(let code, let stderr):
@@ -120,10 +121,10 @@ public final class LocalCLIConfigStore: @unchecked Sendable {
             defaults.set(true, forKey: Self.timeoutMigrationKey)
         }
         guard let data = defaults.data(forKey: Self.configKey),
-              let config = try? JSONDecoder().decode(LocalCLIConfig.self, from: data)
+            let config = try? JSONDecoder().decode(LocalCLIConfig.self, from: data)
         else { return nil }
         guard needsTimeoutMigration,
-              config.timeoutSeconds == LocalCLIConfig.legacyDefaultTimeout
+            config.timeoutSeconds == LocalCLIConfig.legacyDefaultTimeout
         else { return config }
         let migrated = LocalCLIConfig(commandTemplate: config.commandTemplate)
         try? save(migrated)
@@ -260,6 +261,24 @@ public final class LocalCLIExecutor: Sendable {
         )
     }
 
+    /// Executes an app-owned invocation directly, without shell startup files.
+    func executeInvocation(
+        arguments: [String], environment: [String: String], workingDirectory: URL,
+        prompt: String, timeout: Double
+    ) async throws -> String {
+        try await runProcess(
+            commandTemplate: "", fullPrompt: prompt, timeout: timeout,
+            invocation: Invocation(
+                arguments: arguments, environment: environment,
+                workingDirectory: workingDirectory))
+    }
+
+    private struct Invocation: Sendable {
+        let arguments: [String]
+        let environment: [String: String]
+        let workingDirectory: URL
+    }
+
     /// Connection tests use a trivial prompt, so a hung command should not
     /// pin the settings UI for the full (now minutes-long) generation timeout.
     static let testConnectionTimeoutCap: Double = 45
@@ -318,14 +337,7 @@ public final class LocalCLIExecutor: Sendable {
     }
 
     static func executionWorkingDirectory(fileManager: FileManager = .default) throws -> URL {
-        let appSupportDirectory = try fileManager.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
-        let workingDirectory = appSupportDirectory
-            .appendingPathComponent("MacParakeet", isDirectory: true)
+        let workingDirectory = URL(fileURLWithPath: AppPaths.appSupportDir, isDirectory: true)
             .appendingPathComponent("LocalCLI", isDirectory: true)
         try fileManager.createDirectory(at: workingDirectory, withIntermediateDirectories: true)
         return workingDirectory
@@ -336,7 +348,8 @@ public final class LocalCLIExecutor: Sendable {
     private func runProcess(
         commandTemplate: String,
         fullPrompt: String,
-        timeout: Double
+        timeout: Double,
+        invocation: Invocation? = nil
     ) async throws -> String {
         let clampedTimeout = max(LocalCLIConfig.minimumTimeout, timeout)
         let state = ProcessExecutionState()
@@ -351,7 +364,9 @@ public final class LocalCLIExecutor: Sendable {
                     }
 
                     var environment = ProcessInfo.processInfo.environment
-                    environment["PATH"] = preferredPATH(fallback: environment["PATH"])
+                    if invocation == nil {
+                        environment["PATH"] = preferredPATH(fallback: environment["PATH"])
+                    }
 
                     let inputPipe = Pipe()
                     let outputPipe = Pipe()
@@ -363,13 +378,15 @@ public final class LocalCLIExecutor: Sendable {
                     do {
                         processID = try Self.spawnShell(
                             command: Self.wrappedCommandTemplate(commandTemplate),
-                            environment: environment,
+                            environment: invocation?.environment ?? environment,
+                            invocation: invocation,
                             inputPipe: inputPipe,
                             outputPipe: outputPipe,
                             errorPipe: errorPipe
                         )
                     } catch {
-                        let failure: Error = state.isCancelled
+                        let failure: Error =
+                            state.isCancelled
                             ? CancellationError()
                             : LocalCLIError.executionFailed(error.localizedDescription)
                         Self.resume(continuation, state: state, result: .failure(failure))
@@ -507,9 +524,10 @@ public final class LocalCLIExecutor: Sendable {
                             Self.resume(
                                 continuation,
                                 state: state,
-                                result: .failure(LocalCLIError.commandNotFound(
-                                    stderr.isEmpty ? commandTemplate : stderr
-                                ))
+                                result: .failure(
+                                    LocalCLIError.commandNotFound(
+                                        stderr.isEmpty ? commandTemplate : stderr
+                                    ))
                             )
                         } else {
                             Self.resume(
@@ -539,14 +557,15 @@ public final class LocalCLIExecutor: Sendable {
     private static func spawnShell(
         command: String,
         environment: [String: String],
+        invocation: Invocation? = nil,
         inputPipe: Pipe,
         outputPipe: Pipe,
         errorPipe: Pipe
     ) throws -> Int32 {
-        let executable = "/bin/zsh"
-        let arguments = [executable, "-lc", command]
+        let executable = invocation == nil ? "/bin/zsh" : "/usr/bin/env"
+        let arguments = invocation.map { [executable] + $0.arguments } ?? [executable, "-lc", command]
         let environmentStrings = environment.map { "\($0.key)=\($0.value)" }
-        let workingDirectory = try executionWorkingDirectory()
+        let workingDirectory = try invocation?.workingDirectory ?? executionWorkingDirectory()
 
         var fileActions: posix_spawn_file_actions_t? = nil
         guard posix_spawn_file_actions_init(&fileActions) == 0 else {
@@ -563,16 +582,16 @@ public final class LocalCLIExecutor: Sendable {
 
         let configuredFileActions = workingDirectory.withUnsafeFileSystemRepresentation { workingDirectoryPath in
             guard let workingDirectoryPath else { return false }
-            return addChangeDirectoryAction(&fileActions, path: workingDirectoryPath) &&
-                posix_spawn_file_actions_adddup2(&fileActions, stdinRead, STDIN_FILENO) == 0 &&
-                posix_spawn_file_actions_adddup2(&fileActions, stdoutWrite, STDOUT_FILENO) == 0 &&
-                posix_spawn_file_actions_adddup2(&fileActions, stderrWrite, STDERR_FILENO) == 0 &&
-                posix_spawn_file_actions_addclose(&fileActions, stdinWrite) == 0 &&
-                posix_spawn_file_actions_addclose(&fileActions, stdoutRead) == 0 &&
-                posix_spawn_file_actions_addclose(&fileActions, stderrRead) == 0 &&
-                posix_spawn_file_actions_addclose(&fileActions, stdinRead) == 0 &&
-                posix_spawn_file_actions_addclose(&fileActions, stdoutWrite) == 0 &&
-                posix_spawn_file_actions_addclose(&fileActions, stderrWrite) == 0
+            return addChangeDirectoryAction(&fileActions, path: workingDirectoryPath)
+                && posix_spawn_file_actions_adddup2(&fileActions, stdinRead, STDIN_FILENO) == 0
+                && posix_spawn_file_actions_adddup2(&fileActions, stdoutWrite, STDOUT_FILENO) == 0
+                && posix_spawn_file_actions_adddup2(&fileActions, stderrWrite, STDERR_FILENO) == 0
+                && posix_spawn_file_actions_addclose(&fileActions, stdinWrite) == 0
+                && posix_spawn_file_actions_addclose(&fileActions, stdoutRead) == 0
+                && posix_spawn_file_actions_addclose(&fileActions, stderrRead) == 0
+                && posix_spawn_file_actions_addclose(&fileActions, stdinRead) == 0
+                && posix_spawn_file_actions_addclose(&fileActions, stdoutWrite) == 0
+                && posix_spawn_file_actions_addclose(&fileActions, stderrWrite) == 0
         }
         guard configuredFileActions else {
             throw LocalCLIError.executionFailed("Unable to configure spawn file actions")
@@ -586,7 +605,7 @@ public final class LocalCLIExecutor: Sendable {
 
         let flags = Int16(POSIX_SPAWN_SETPGROUP)
         guard posix_spawnattr_setflags(&attr, flags) == 0,
-              posix_spawnattr_setpgroup(&attr, 0) == 0
+            posix_spawnattr_setpgroup(&attr, 0) == 0
         else {
             throw LocalCLIError.executionFailed("Unable to configure spawn process group")
         }
@@ -723,7 +742,8 @@ public final class LocalCLIExecutor: Sendable {
         var pollCount = 0
         while state.shouldMonitor(processID: rootPID) {
             state.recordObservedDescendants(descendantProcessIDs(of: rootPID))
-            let interval = pollCount < Self.processTreeWarmupPollCount
+            let interval =
+                pollCount < Self.processTreeWarmupPollCount
                 ? Self.processTreeWarmupPollIntervalUs
                 : Self.processTreePollIntervalUs
             usleep(interval)
@@ -815,10 +835,10 @@ public final class LocalCLIExecutor: Sendable {
     static func discoverPATH(timeout: Double = 3) -> String? {
         let deadline = Date().addingTimeInterval(timeout)
         let script = """
-        printf '%s\\n' '\(pathStartMarker)'
-        printf '%s\\n' "$PATH"
-        printf '%s\\n' '\(pathEndMarker)'
-        """
+            printf '%s\\n' '\(pathStartMarker)'
+            printf '%s\\n' "$PATH"
+            printf '%s\\n' '\(pathEndMarker)'
+            """
 
         for executableURL in candidatePATHProbeShellURLs() {
             for arguments in pathProbeArguments(forShellPath: executableURL.path, script: script) {
@@ -849,11 +869,13 @@ public final class LocalCLIExecutor: Sendable {
         ],
         timeout: Double = 3
     ) -> String? {
-        guard let output = processOutput(
-            executableURL: executableURL,
-            arguments: arguments,
-            timeout: timeout
-        ) else {
+        guard
+            let output = processOutput(
+                executableURL: executableURL,
+                arguments: arguments,
+                timeout: timeout
+            )
+        else {
             return nil
         }
 
@@ -933,9 +955,9 @@ public final class LocalCLIExecutor: Sendable {
         var seen = Set<String>()
         return candidatePaths.compactMap { path in
             guard let path,
-                  path.hasPrefix("/"),
-                  seen.insert(path).inserted,
-                  fileManager.isExecutableFile(atPath: path)
+                path.hasPrefix("/"),
+                seen.insert(path).inserted,
+                fileManager.isExecutableFile(atPath: path)
             else {
                 return nil
             }
@@ -965,7 +987,7 @@ public final class LocalCLIExecutor: Sendable {
 
     static func userLoginShellURL() -> URL? {
         guard let pwdEntry = getpwuid(getuid()),
-              let shell = pwdEntry.pointee.pw_shell
+            let shell = pwdEntry.pointee.pw_shell
         else {
             return nil
         }
@@ -976,11 +998,13 @@ public final class LocalCLIExecutor: Sendable {
     }
 
     static func discoverPATHWithPathHelper(timeout: Double) -> String? {
-        guard let output = processOutput(
-            executableURL: URL(fileURLWithPath: "/usr/libexec/path_helper"),
-            arguments: ["-s"],
-            timeout: timeout
-        ) else {
+        guard
+            let output = processOutput(
+                executableURL: URL(fileURLWithPath: "/usr/libexec/path_helper"),
+                arguments: ["-s"],
+                timeout: timeout
+            )
+        else {
             return nil
         }
 
@@ -989,7 +1013,7 @@ public final class LocalCLIExecutor: Sendable {
 
     static func parseMarkedPATH(in output: String) -> String? {
         guard let startRange = output.range(of: pathStartMarker),
-              let endRange = output.range(of: pathEndMarker, range: startRange.upperBound..<output.endIndex)
+            let endRange = output.range(of: pathEndMarker, range: startRange.upperBound..<output.endIndex)
         else {
             return nil
         }
@@ -1006,7 +1030,8 @@ public final class LocalCLIExecutor: Sendable {
             guard line.hasPrefix("PATH=") else { continue }
 
             let assignment = line.dropFirst("PATH=".count)
-            let value = assignment.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)
+            let value =
+                assignment.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)
                 .first?
                 .trimmingCharacters(in: CharacterSet(charactersIn: "\"'")) ?? ""
             return value.isEmpty ? nil : String(value)

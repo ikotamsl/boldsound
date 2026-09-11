@@ -4,6 +4,7 @@ import Foundation
 /// HTTP-based providers go to `LLMClient`; `.localCLI` goes to
 /// `LocalCLILLMClient`; `.inProcessLocal` goes to `InProcessLLMClient`.
 public final class RoutingLLMClient: LLMClientProtocol, Sendable {
+    private let subscriptionClient: any LLMClientProtocol
     private let httpClient: any LLMClientProtocol
     private let cliClient: any LLMClientProtocol
     private let inProcessClient: any LLMClientProtocol
@@ -11,8 +12,10 @@ public final class RoutingLLMClient: LLMClientProtocol, Sendable {
     public init(
         httpClient: any LLMClientProtocol = LLMClient(),
         cliClient: any LLMClientProtocol = LocalCLILLMClient(),
-        inProcessClient: any LLMClientProtocol = InProcessLLMClient()
+        inProcessClient: any LLMClientProtocol = InProcessLLMClient(),
+        subscriptionClient: any LLMClientProtocol = SubscriptionLLMClient()
     ) {
+        self.subscriptionClient = subscriptionClient
         self.httpClient = httpClient
         self.cliClient = cliClient
         self.inProcessClient = inProcessClient
@@ -57,6 +60,7 @@ public final class RoutingLLMClient: LLMClientProtocol, Sendable {
     }
 
     private func client(for context: LLMExecutionContext) -> any LLMClientProtocol {
+        if context.providerConfig.authenticationMode == .subscription { return subscriptionClient }
         switch context.providerConfig.id {
         case .localCLI:
             return cliClient

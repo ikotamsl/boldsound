@@ -286,6 +286,40 @@ public enum LLMProviderID: String, Codable, Sendable, CaseIterable {
 
 }
 
+public enum LLMAuthenticationMode: String, Codable, Sendable, CaseIterable {
+    case apiKey
+    case subscription
+}
+
+extension LLMProviderID {
+    public var supportsSubscription: Bool { self == .openai || self == .gemini }
+
+    public var subscriptionExplanation: String {
+        switch self {
+        case .openai:
+            return
+                "Uses the official Codex CLI with your saved ChatGPT login. Run codex login in Terminal, then test the selected model. ChatGPT access does not include every API model."
+        case .gemini:
+            return
+                "Uses the official Gemini CLI with your saved Google login and eligible Google AI plan or free allowance. Run gemini in Terminal and choose Sign in with Google, then test the selected model."
+        case .anthropic:
+            return
+                "Claude subscriptions are not supported for this app integration. Use an Anthropic API key; Claude chat subscriptions do not include API usage."
+        case .openrouter:
+            return
+                "Subscription access is not supported. OpenRouter uses an API key and credits; subscriptions to individual chat providers do not transfer."
+        case .openaiCompatible:
+            return
+                "There is no standard subscription sign-in for custom endpoints. Use the authentication required by your server."
+        case .ollama, .lmstudio, .inProcessLocal:
+            return "Local inference does not require a subscription."
+        case .localCLI:
+            return
+                "Authentication and billing are managed by your custom command. Choose OpenAI or Google Gemini above for verified account access."
+        }
+    }
+}
+
 // MARK: - Provider Configuration
 
 public struct LLMProviderConfig: Codable, Sendable, Equatable {
@@ -294,16 +328,21 @@ public struct LLMProviderConfig: Codable, Sendable, Equatable {
     public let apiKey: String?
     public let modelName: String
     public let isLocal: Bool
+    public let authenticationMode: LLMAuthenticationMode
 
     // Exclude apiKey from Codable to prevent leaking to UserDefaults
     private enum CodingKeys: String, CodingKey {
-        case id, baseURL, modelName, isLocal
+        case id, baseURL, modelName, isLocal, authenticationMode
     }
 
-    public init(id: LLMProviderID, baseURL: URL, apiKey: String?, modelName: String, isLocal: Bool) {
+    public init(
+        id: LLMProviderID, baseURL: URL, apiKey: String?, modelName: String, isLocal: Bool,
+        authenticationMode: LLMAuthenticationMode = .apiKey
+    ) {
         self.id = id
         self.baseURL = baseURL
-        self.apiKey = apiKey
+        self.apiKey = authenticationMode == .subscription ? nil : apiKey
+        self.authenticationMode = authenticationMode
         self.modelName = modelName
         self.isLocal = isLocal
     }
@@ -314,6 +353,8 @@ public struct LLMProviderConfig: Codable, Sendable, Equatable {
         baseURL = try container.decode(URL.self, forKey: .baseURL)
         modelName = try container.decode(String.self, forKey: .modelName)
         isLocal = try container.decode(Bool.self, forKey: .isLocal)
+        authenticationMode =
+            try container.decodeIfPresent(LLMAuthenticationMode.self, forKey: .authenticationMode) ?? .apiKey
         apiKey = nil  // Excluded from Codable — hydrated from Keychain separately
     }
 

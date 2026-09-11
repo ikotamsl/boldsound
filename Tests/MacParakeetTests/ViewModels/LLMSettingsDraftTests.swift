@@ -3,6 +3,26 @@ import XCTest
 @testable import MacParakeetCore
 
 final class LLMSettingsDraftTests: XCTestCase {
+    func testSubscriptionDraftIgnoresAPIEndpointAndRestoresMode() throws {
+        var draft = LLMSettingsDraft(
+            providerID: .openai, apiKeyInput: "saved-key", suggestedModelName: "chosen",
+            baseURLOverride: "http://invalid")
+        draft.authenticationMode = .subscription
+        XCTAssertFalse(draft.requiresAPIKey)
+        XCTAssertFalse(draft.supportsAPIKey)
+        let config = try XCTUnwrap(draft.buildConfig(defaultBaseURL: LLMProviderID.openai.defaultBaseURL))
+        XCTAssertEqual(config.authenticationMode, .subscription)
+        XCTAssertEqual(config.modelName, "chosen")
+        XCTAssertEqual(config.baseURL.absoluteString, LLMProviderID.openai.defaultBaseURL)
+        XCTAssertNil(config.apiKey)
+        let restored = LLMSettingsDraft.fromStoredConfig(
+            config, suggestedModels: ["chosen"], defaultModelName: "chosen",
+            defaultBaseURL: LLMProviderID.openai.defaultBaseURL)
+        XCTAssertEqual(restored.authenticationMode, .subscription)
+        draft.providerID = .anthropic
+        XCTAssertEqual(draft.validationError, .unsupportedSubscription)
+    }
+
     func testHTTPRemoteBaseURLIsRejected() {
         let draft = LLMSettingsDraft(
             providerID: .openai,

@@ -38,13 +38,16 @@ public final class LLMConfigStore: LLMConfigStoreProtocol, @unchecked Sendable {
     public func loadConfig() throws -> LLMProviderConfig? {
         guard let data = defaults.data(forKey: Self.configKey) else { return nil }
         let decoded = try JSONDecoder().decode(LLMProviderConfig.self, from: data)
-        let apiKey = try keychain.getString(Self.apiKeyKeychainKey(for: decoded.id))
+        let apiKey =
+            decoded.authenticationMode == .subscription
+            ? nil : try keychain.getString(Self.apiKeyKeychainKey(for: decoded.id))
         return LLMProviderConfig(
             id: decoded.id,
             baseURL: decoded.baseURL,
             apiKey: apiKey,
             modelName: decoded.modelName,
-            isLocal: decoded.isLocal
+            isLocal: decoded.isLocal,
+            authenticationMode: decoded.authenticationMode
         )
     }
 
@@ -54,7 +57,7 @@ public final class LLMConfigStore: LLMConfigStoreProtocol, @unchecked Sendable {
         defaults.set(data, forKey: Self.configKey)
 
         // Local CLI has no API key — skip Keychain operations
-        guard config.id != .localCLI else { return }
+        guard config.id != .localCLI, config.authenticationMode != .subscription else { return }
 
         // Save apiKey to per-provider Keychain key
         let providerKey = Self.apiKeyKeychainKey(for: config.id)
@@ -68,7 +71,8 @@ public final class LLMConfigStore: LLMConfigStoreProtocol, @unchecked Sendable {
     public func deleteConfig() throws {
         // Only delete the active provider's key, preserving keys for other providers
         if let data = defaults.data(forKey: Self.configKey),
-           let decoded = try? JSONDecoder().decode(LLMProviderConfig.self, from: data) {
+            let decoded = try? JSONDecoder().decode(LLMProviderConfig.self, from: data)
+        {
             try keychain.delete(Self.apiKeyKeychainKey(for: decoded.id))
         }
         defaults.removeObject(forKey: Self.configKey)
@@ -77,7 +81,8 @@ public final class LLMConfigStore: LLMConfigStoreProtocol, @unchecked Sendable {
     public func loadAPIKey() throws -> String? {
         // Load key for the currently saved provider
         guard let data = defaults.data(forKey: Self.configKey),
-              let decoded = try? JSONDecoder().decode(LLMProviderConfig.self, from: data) else {
+            let decoded = try? JSONDecoder().decode(LLMProviderConfig.self, from: data)
+        else {
             return nil
         }
         return try loadAPIKey(for: decoded.id)
@@ -90,7 +95,8 @@ public final class LLMConfigStore: LLMConfigStoreProtocol, @unchecked Sendable {
     public func saveAPIKey(_ key: String) throws {
         // Save key for the currently saved provider
         guard let data = defaults.data(forKey: Self.configKey),
-              let decoded = try? JSONDecoder().decode(LLMProviderConfig.self, from: data) else {
+            let decoded = try? JSONDecoder().decode(LLMProviderConfig.self, from: data)
+        else {
             return
         }
         try keychain.setString(key, forKey: Self.apiKeyKeychainKey(for: decoded.id))
@@ -98,7 +104,8 @@ public final class LLMConfigStore: LLMConfigStoreProtocol, @unchecked Sendable {
 
     public func deleteAPIKey() throws {
         guard let data = defaults.data(forKey: Self.configKey),
-              let decoded = try? JSONDecoder().decode(LLMProviderConfig.self, from: data) else {
+            let decoded = try? JSONDecoder().decode(LLMProviderConfig.self, from: data)
+        else {
             return
         }
         try keychain.delete(Self.apiKeyKeychainKey(for: decoded.id))
@@ -111,7 +118,8 @@ public final class LLMConfigStore: LLMConfigStoreProtocol, @unchecked Sendable {
             baseURL: existing.baseURL,
             apiKey: existing.apiKey,
             modelName: modelName,
-            isLocal: existing.isLocal
+            isLocal: existing.isLocal,
+            authenticationMode: existing.authenticationMode
         )
         try saveConfig(updated)
     }

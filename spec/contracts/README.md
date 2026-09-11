@@ -40,3 +40,5 @@ Each contract document should include:
 - [CLI JSON v1](cli-json-v1.md)
 
 - [Meeting agent JSON v1](meeting-agent-v1.md)
+
+- [LLM authentication](llm-authentication.md) — API vs account access, persistence and no billing fallback.

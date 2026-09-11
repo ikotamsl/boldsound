@@ -128,7 +128,7 @@ struct LLMSettingsView: View {
                     }
 
                     // Advanced: Base URL override
-                    if viewModel.selectedProviderID?.requiresCustomEndpoint != true {
+                    if !viewModel.usesSubscription && viewModel.selectedProviderID?.requiresCustomEndpoint != true {
                         DisclosureGroup("Advanced", isExpanded: $showAdvanced) {
                             HStack(alignment: .top) {
                                 VStack(alignment: .leading, spacing: 2) {
@@ -263,7 +263,7 @@ struct LLMSettingsView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Current choice")
                         .font(DesignSystem.Typography.body)
-                    Text("Choose a local provider, an API key, or a command-line AI tool.")
+                    Text("Choose a provider and how to access it.")
                         .font(DesignSystem.Typography.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -277,6 +277,30 @@ struct LLMSettingsView: View {
                 .labelsHidden()
                 .pickerStyle(.menu)
                 .frame(width: 190)
+            }
+
+            if let provider = viewModel.selectedProviderID {
+                if provider.supportsSubscription {
+                    Picker("Access", selection: $viewModel.authenticationMode) {
+                        Text("API key").tag(LLMAuthenticationMode.apiKey)
+                        Text("Subscription").tag(LLMAuthenticationMode.subscription)
+                    }
+                    .pickerStyle(.segmented)
+                    .accessibilityIdentifier("ai.authenticationMode")
+                }
+                Text(provider.subscriptionExplanation)
+                    .font(DesignSystem.Typography.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if viewModel.usesSubscription {
+                    Text(
+                        "Test Connection checks this exact model using a small request. Save is available after a successful test. No automatic fallback to API billing."
+                    )
+                    .font(DesignSystem.Typography.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
 
             if viewModel.selectedProviderID == nil {
@@ -1892,6 +1916,11 @@ struct LLMSettingsView: View {
         isCLI: Bool,
         usesInsecureHTTP: Bool
     ) -> String {
+        if viewModel.usesSubscription {
+            return viewModel.selectedProviderID == .gemini
+                ? "Transcript text is sent through Gemini CLI to Google. Gemini CLI also saves chat history locally under ~/.gemini; manage retention in Gemini CLI."
+                : "Transcript text is sent through Codex CLI using your ChatGPT account. Runs use ephemeral sessions."
+        }
         if usesInsecureHTTP {
             return "Transcript text is sent to your local AI endpoint over HTTP. Use a trusted network."
         }
@@ -1956,7 +1985,7 @@ struct LLMSettingsView: View {
                 Text(message)
                     .font(DesignSystem.Typography.caption)
                     .foregroundStyle(DesignSystem.Colors.errorRed)
-                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -1991,7 +2020,7 @@ struct LLMSettingsView: View {
                 Text(message)
                     .font(DesignSystem.Typography.caption)
                     .foregroundStyle(DesignSystem.Colors.errorRed)
-                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
