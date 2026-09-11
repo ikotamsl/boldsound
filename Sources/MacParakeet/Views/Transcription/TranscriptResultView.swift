@@ -222,7 +222,12 @@ struct TranscriptResultView: View {
     ]
 
     var body: some View {
-        adaptiveLayout
+        VStack(spacing: 0) {
+            if activeTranscription.sourceType == .meeting {
+                MeetingAgentControls(transcription: activeTranscription).padding(8)
+            }
+            adaptiveLayout
+        }
         .onAppear {
             // Lazy migration for existing webm/opus YouTube audio files
             // saved before issue #237's playback fix shipped. The VM

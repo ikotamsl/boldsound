@@ -27,6 +27,7 @@ public protocol CalendarServicing: Sendable {
     /// `CalendarError.permissionDenied` when access is missing or
     /// `CalendarError.fetchFailed` for malformed input.
     func fetchUpcomingEvents(from: Date, days: Int?) async throws -> [CalendarEvent]
+    func searchEvents(from: Date, to: Date, query: String) async throws -> [CalendarEvent]
 }
 
 extension CalendarService: CalendarServicing {}
@@ -35,6 +36,10 @@ extension CalendarService: CalendarServicing {}
 /// concrete `CalendarService` default. Defined on the protocol so mocks
 /// inherit it for free.
 public extension CalendarServicing {
+    func searchEvents(from: Date, to: Date, query: String) async throws -> [CalendarEvent] {
+        throw CalendarError.fetchFailed("Manual calendar search is unavailable.")
+    }
+
     func fetchUpcomingEvents(days: Int? = nil) async throws -> [CalendarEvent] {
         try await fetchUpcomingEvents(from: Date(), days: days)
     }

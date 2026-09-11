@@ -170,6 +170,20 @@ public actor CalendarService {
             .sorted { $0.startTime < $1.startTime }
     }
 
+    /// Manual selection includes past/future, all-day and declined events,
+    /// independently of the automatic recording filters.
+    public func searchEvents(from: Date, to: Date, query: String) async throws -> [CalendarEvent] {
+        guard permissionStatus == .granted else { throw CalendarError.permissionDenied }
+        guard to > from, to.timeIntervalSince(from) <= 366 * 86_400 else {
+            throw CalendarError.fetchFailed("Choose a date range of at most one year.")
+        }
+        eventStore.reset()
+        let predicate = eventStore.predicateForEvents(withStart: from, end: to, calendars: nil)
+        return eventStore.events(matching: predicate).compactMap { convertEvent($0) }
+            .filter { query.isEmpty || $0.title.localizedCaseInsensitiveContains(query) }
+            .sorted { $0.startTime < $1.startTime }
+    }
+
     // MARK: - EKEvent → CalendarEvent
 
     private func convertEvent(_ ekEvent: EKEvent) -> CalendarEvent? {

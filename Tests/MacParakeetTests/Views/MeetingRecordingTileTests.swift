@@ -99,7 +99,13 @@ final class MeetingRecordingTileTests: XCTestCase {
         viewModel.showAudioSavedConfirmation(duration: .milliseconds(10))
 
         XCTAssertTrue(viewModel.showsAudioSavedConfirmation)
-        try await Task.sleep(for: .milliseconds(40))
-        XCTAssertFalse(viewModel.showsAudioSavedConfirmation)
+        // Parallel CI may delay the MainActor task beyond its requested sleep.
+        // Check eventual clearing rather than assuming a 40 ms scheduling budget.
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(2)
+        while viewModel.showsAudioSavedConfirmation && clock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(viewModel.showsAudioSavedConfirmation, "Audio-saved confirmation did not clear")
     }
 }

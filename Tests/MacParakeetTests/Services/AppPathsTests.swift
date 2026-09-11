@@ -4,13 +4,13 @@ import FluidAudio
 
 final class AppPathsTests: XCTestCase {
 
-    func testAppSupportDirContainsMacParakeet() {
-        XCTAssertTrue(AppPaths.appSupportDir.hasSuffix("MacParakeet"))
+    func testAppSupportDirContainsBoldSound() {
+        XCTAssertTrue(AppPaths.appSupportDir.hasSuffix("BoldSound"))
     }
 
     func testDatabasePathIsInsideAppSupport() {
         XCTAssertTrue(AppPaths.databasePath.hasPrefix(AppPaths.appSupportDir))
-        XCTAssertTrue(AppPaths.databasePath.hasSuffix("macparakeet.db"))
+        XCTAssertTrue(AppPaths.databasePath.hasSuffix("boldsound.db"))
     }
 
     func testDictationsDirIsInsideAppSupport() {
@@ -46,7 +46,7 @@ final class AppPathsTests: XCTestCase {
     }
 
     func testMeetingRecordingsDirCanBeConfiguredFromDefaults() {
-        let suiteName = "macparakeet.test.paths.\(UUID().uuidString)"
+        let suiteName = "boldsound.test.paths.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
@@ -65,20 +65,23 @@ final class AppPathsTests: XCTestCase {
     #if DEBUG
     func testDebugAppStateDirOverridesAppSupport() {
         let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("macparakeet-debug-state-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("boldsound-debug-state-\(UUID().uuidString)", isDirectory: true)
             .standardizedFileURL
         let environment = [AppPaths.debugAppStateDirEnvironmentKey: root.path]
 
         XCTAssertEqual(AppPaths.resolvedAppSupportDir(environment: environment), root.path)
-        XCTAssertEqual(AppPaths.defaultMeetingRecordingsDir(environment: environment), root.appendingPathComponent("meeting-recordings").path)
+        XCTAssertEqual(
+            AppPaths.defaultMeetingRecordingsDir(environment: environment),
+            root.appendingPathComponent("meeting-recordings").path)
     }
 
     func testDebugAppStateDirScopesFluidAudioModelsInsideThrowawayRoot() {
         let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("macparakeet-debug-state-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("boldsound-debug-state-\(UUID().uuidString)", isDirectory: true)
             .standardizedFileURL
         let environment = [AppPaths.debugAppStateDirEnvironmentKey: root.path]
-        let expectedModelsDir = root
+        let expectedModelsDir =
+            root
             .appendingPathComponent("FluidAudio", isDirectory: true)
             .appendingPathComponent("Models", isDirectory: true)
 
@@ -94,17 +97,17 @@ final class AppPathsTests: XCTestCase {
     }
 
     func testDebugAppStateDirKeepsMeetingRecordingsInsideThrowawayRoot() {
-        let suiteName = "macparakeet.test.paths.\(UUID().uuidString)"
+        let suiteName = "boldsound.test.paths.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         let realLookingCustom = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("MacParakeetRealArtifacts")
+            .appendingPathComponent("BoldSoundRealArtifacts")
             .path
         defaults.set(realLookingCustom, forKey: AppPaths.meetingArtifactsFolderKey)
 
         let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("macparakeet-debug-state-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("boldsound-debug-state-\(UUID().uuidString)", isDirectory: true)
             .standardizedFileURL
         let environment = [AppPaths.debugAppStateDirEnvironmentKey: root.path]
 
@@ -117,17 +120,17 @@ final class AppPathsTests: XCTestCase {
 
     func testLogsDirIsInsideUserLogs() {
         XCTAssertTrue(AppPaths.logsDir.contains("Library/Logs"))
-        XCTAssertTrue(AppPaths.logsDir.hasSuffix("MacParakeet"))
+        XCTAssertTrue(AppPaths.logsDir.hasSuffix("BoldSound"))
     }
 
-    func testTempDirContainsMacParakeet() {
-        XCTAssertTrue(AppPaths.tempDir.contains("macparakeet"))
+    func testTempDirContainsBoldSound() {
+        XCTAssertTrue(AppPaths.tempDir.contains("boldsound"))
     }
 
     func testEnsureDirectoriesCreatesAll() throws {
         // Use a unique temp directory to avoid polluting real app support
         let testRoot = FileManager.default.temporaryDirectory
-            .appendingPathComponent("macparakeet_test_\(UUID().uuidString)")
+            .appendingPathComponent("boldsound_test_\(UUID().uuidString)")
         let fm = FileManager.default
 
         // Create subdirectories that mirror the AppPaths structure

@@ -125,6 +125,7 @@ extension TranscriptionRepositoryProtocol {
 // advertise Swift Sendable conformance.
 public final class TranscriptionRepository: TranscriptionRepositoryProtocol, @unchecked Sendable {
     private let dbQueue: DatabaseQueue
+    private let meetingAgentConfiguration: @Sendable () -> MeetingAgentConfiguration
     private static let libraryDisplayTitleExpression = """
         COALESCE(
             CASE
@@ -139,13 +140,19 @@ public final class TranscriptionRepository: TranscriptionRepositoryProtocol, @un
         )
         """
 
-    public init(dbQueue: DatabaseQueue) {
+    public init(dbQueue: DatabaseQueue, meetingAgentConfiguration: @escaping @Sendable () -> MeetingAgentConfiguration = { MeetingAgentConfiguration() }) {
         self.dbQueue = dbQueue
+        self.meetingAgentConfiguration = meetingAgentConfiguration
     }
 
     public func save(_ transcription: Transcription) throws {
         try dbQueue.write { db in
+            try MeetingAgentBindingRepository.adoptSessionBinding(for: transcription, db: db)
             try transcription.save(db)
+            let configuration = meetingAgentConfiguration()
+            if configuration.enabled {
+                try MeetingAgentOutboxRepository.insertIntent(transcription, configuration: configuration, db: db)
+            }
         }
     }
 

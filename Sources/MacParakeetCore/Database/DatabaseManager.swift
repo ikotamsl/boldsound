@@ -1314,6 +1314,30 @@ public final class DatabaseManager: Sendable {
                 """)
         }
 
+        migrator.registerMigration("v0.29-meeting-agent") { db in
+            try db.create(table: "meeting_agent_bindings") { t in
+                t.column("id", .text).primaryKey()
+                t.column("version", .integer).notNull().defaults(to: 0)
+                t.column("calendarJSON", .text)
+                t.column("noteJSON", .text)
+                t.column("calendarWasSelected", .boolean).notNull().defaults(to: false)
+            }
+            try db.create(table: "meeting_agent_event_bindings") { t in
+                t.column("id", .text).primaryKey()
+                t.column("calendarJSON", .text).notNull()
+                t.column("noteJSON", .text).notNull()
+            }
+            try db.create(table: "meeting_agent_outbox") { t in
+                t.column("id", .text).primaryKey()
+                t.column("transcriptionID", .text).notNull().indexed()
+                t.column("payload", .text).notNull()
+                t.column("createdAt", .datetime).notNull()
+                t.column("acknowledgedAt", .datetime)
+                t.column("jobID", .text)
+                t.column("error", .text)
+            }
+        }
+
         return migrator
     }
 

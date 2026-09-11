@@ -665,12 +665,22 @@ final class MeetingRecordingFlowCoordinator {
             currentMeetingTrigger = trigger.map(TelemetryMeetingOperationTrigger.init)
             actionTask = Task { @MainActor in
                 do {
+                    var selectedCalendar = calendarEventSnapshot
+                    if let agentService = MeetingAgentViewModel.shared.service,
+                       let agentDraft = try? await agentService.binding(id: MeetingAgentService.draftID),
+                       agentDraft.calendarWasSelected {
+                        selectedCalendar = agentDraft.calendar
+                    }
                     try await meetingRecordingService.startRecording(
                         title: title,
                         sourceMode: sourceMode,
                         startContext: startContext,
-                        calendarEventSnapshot: calendarEventSnapshot
+                        calendarEventSnapshot: selectedCalendar
                     )
+                    if MeetingAgentViewModel.shared.service != nil,
+                       let recordingID = await meetingRecordingService.activeSessionID {
+                        await MeetingAgentViewModel.shared.recordingStarted(id: recordingID)
+                    }
                     var activeLiveSpeechEngineSelection = await meetingRecordingService.activeSpeechEngineSelection
                     if activeLiveSpeechEngineSelection == nil,
                         let speechEngineSelectionProvider
@@ -846,6 +856,7 @@ final class MeetingRecordingFlowCoordinator {
                             throw error
                         }
                         stoppedOutput = output
+                        MeetingAgentViewModel.shared.recordingEnded()
                         appendStopStage(
                             "service_stop",
                             sessionID: output.sessionID,
@@ -938,6 +949,7 @@ final class MeetingRecordingFlowCoordinator {
             }
 
         case .cancelRecording:
+            MeetingAgentViewModel.shared.recordingEnded()
             let durationSeconds = Double(panelViewModel?.elapsedSeconds ?? 0)
             let notesVM = panelViewModel?.notesViewModel
             let cancelledTrigger = currentMeetingTrigger ?? pendingTrigger.map(TelemetryMeetingOperationTrigger.init)
@@ -968,6 +980,7 @@ final class MeetingRecordingFlowCoordinator {
             }
 
         case .showError(let message):
+            MeetingAgentViewModel.shared.recordingEnded()
             cancelSavedCompletion()
             stopPillPolling()
             stopTranscriptObservation()

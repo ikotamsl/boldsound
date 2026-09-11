@@ -1380,3 +1380,30 @@ let processing = try dbQueue.read { db in
 ---
 
 *Last updated: 2026-05-16*
+
+### Meeting agent integration (v0.29)
+
+Three independent GRDB tables support the optional Obsidian agent:
+
+- `meeting_agent_bindings`: `id TEXT PRIMARY KEY`, `version INTEGER NOT NULL
+  DEFAULT 0`, nullable `calendarJSON` and `noteJSON`, `calendarWasSelected BOOLEAN
+  NOT NULL DEFAULT false`. IDs are normalized recording/transcription UUID
+  strings or `next-recording` for the durable draft. The session binding is
+  transferred to the separate transcription UUID on its first save. A manual
+  snapshot never overwrites `transcriptions.calendarEventSnapshot`.
+- `meeting_agent_event_bindings`: `id TEXT PRIMARY KEY`, nonnull `calendarJSON`,
+  `noteJSON`. The key combines event identifier and scheduled occurrence start.
+- `meeting_agent_outbox`: `id TEXT PRIMARY KEY` (request hash), indexed
+  `transcriptionID TEXT NOT NULL`, `payload TEXT NOT NULL`, `createdAt DATETIME
+  NOT NULL`, nullable `acknowledgedAt DATETIME`, `jobID TEXT`, `error TEXT`.
+  Payloads contain local transcript/binding snapshots and profile references,
+  never API keys. Completed meeting saves and intents share one transaction.
+  Superseded pending intents are retained as acknowledged history and are not
+  delivered. Other source types do not produce intents.
+
+Each table has its own repository. Cross-table workflow ownership belongs to
+`MeetingAgentService` and the completed transcription transaction. There is no
+cross-database SQLite access: Python owns its private queue, profiles, source
+membership, event-link revisions and prepared-write journal; the app uses the
+[JSON contract](contracts/meeting-agent-v1.md). Integration records deliberately
+have no destructive cascading foreign keys to user artifacts.

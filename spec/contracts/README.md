@@ -38,3 +38,5 @@ Each contract document should include:
 - [Meeting Artifacts v1](meeting-artifacts-v1.md)
 - [Meeting Recovery and Retention Safety](meeting-recovery-retention.md)
 - [CLI JSON v1](cli-json-v1.md)
+
+- [Meeting agent JSON v1](meeting-agent-v1.md)
