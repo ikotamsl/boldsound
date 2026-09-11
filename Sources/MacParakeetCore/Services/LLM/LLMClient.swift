@@ -103,6 +103,7 @@ public final class LLMClient: LLMClientProtocol, Sendable {
         options: ChatCompletionOptions
     ) async throws -> ChatCompletionResponse {
         let config = context.providerConfig
+        try Self.requireHTTPAuthentication(config)
         return try await adapter(for: config.id)
             .chatCompletion(messages: messages, config: config, options: options)
     }
@@ -121,6 +122,7 @@ public final class LLMClient: LLMClientProtocol, Sendable {
     ) -> AsyncThrowingStream<String, Error> {
         do {
             let config = context.providerConfig
+            try Self.requireHTTPAuthentication(config)
             return try adapter(for: config.id)
                 .chatCompletionStream(messages: messages, config: config, options: options)
         } catch {
@@ -132,11 +134,13 @@ public final class LLMClient: LLMClientProtocol, Sendable {
 
     public func testConnection(context: LLMExecutionContext) async throws {
         let config = context.providerConfig
+        try Self.requireHTTPAuthentication(config)
         try await adapter(for: config.id).testConnection(config: config)
     }
 
     public func listModels(context: LLMExecutionContext) async throws -> [String] {
         let config = context.providerConfig
+        try Self.requireHTTPAuthentication(config)
         guard config.id.modelListEndpoint != .none else {
             throw LLMError.connectionFailed("Model listing is not supported for this provider.")
         }
@@ -176,6 +180,12 @@ public final class LLMClient: LLMClientProtocol, Sendable {
 
     static func scrubAPIKeyArtifacts(from message: String) -> String {
         LLMHTTPErrorMapper.scrubAPIKeyArtifacts(from: message)
+    }
+
+    private static func requireHTTPAuthentication(_ config: LLMProviderConfig) throws {
+        guard config.authenticationMode == .apiKey else {
+            throw LLMError.connectionFailed("Subscription access requires the official CLI, not an HTTP API request.")
+        }
     }
 
     private func adapter(for id: LLMProviderID) throws -> any LLMHTTPAdapter {

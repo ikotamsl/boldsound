@@ -3,6 +3,28 @@ import XCTest
 
 final class RoutingLLMClientTests: XCTestCase {
 
+    func testSubscriptionRoutesToAccountClient() async throws {
+        let client = StubLLMClient(response: ChatCompletionResponse(content: "account", model: "selected"))
+        let router = RoutingLLMClient(subscriptionClient: client)
+        for provider in [LLMProviderID.openai, .gemini] {
+            let config = LLMProviderConfig(
+                id: provider, baseURL: URL(string: "https://invalid")!, apiKey: nil,
+                modelName: "selected", isLocal: false, authenticationMode: .subscription)
+            let response = try await router.chatCompletion(
+                messages: [], context: LLMExecutionContext(providerConfig: config), options: .default)
+            XCTAssertEqual(response.content, "account")
+            let context = LLMExecutionContext(providerConfig: config)
+            try await router.testConnection(context: context)
+            let models = try await router.listModels(context: context)
+            XCTAssertEqual(models, [])
+            var streamed = ""
+            for try await chunk in router.chatCompletionStream(messages: [], context: context, options: .default) {
+                streamed += chunk
+            }
+            XCTAssertEqual(streamed, "account")
+        }
+    }
+
     func testLocalCLIContextRoutesToCLIClient() async throws {
         let cliConfig = LocalCLIConfig(commandTemplate: "printf routed", timeoutSeconds: 10)
         let context = LLMExecutionContext(

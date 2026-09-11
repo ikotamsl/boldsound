@@ -18,6 +18,25 @@ final class LLMConfigStoreTests: XCTestCase {
         defaults.removePersistentDomain(forName: suiteName)
     }
 
+    func testSubscriptionRoundTripPreservesModeAndSavedAPIKey() throws {
+        try store.saveConfig(.openai(apiKey: "saved-key"))
+        let config = LLMProviderConfig(
+            id: .openai, baseURL: URL(string: LLMProviderID.openai.defaultBaseURL)!,
+            apiKey: nil, modelName: "account-model", isLocal: false, authenticationMode: .subscription)
+        try store.saveConfig(config)
+        XCTAssertEqual(try store.loadConfig(), config)
+        XCTAssertEqual(try store.loadAPIKey(for: .openai), "saved-key")
+        try store.updateModelName("other-account-model")
+        XCTAssertEqual(try store.loadConfig()?.authenticationMode, .subscription)
+        XCTAssertEqual(try store.loadAPIKey(for: .openai), "saved-key")
+    }
+
+    func testLegacyConfigurationDefaultsToAPIKey() throws {
+        let data = Data(
+            #"{"id":"openai","baseURL":"https://api.openai.com/v1","modelName":"legacy","isLocal":false}"#.utf8)
+        XCTAssertEqual(try JSONDecoder().decode(LLMProviderConfig.self, from: data).authenticationMode, .apiKey)
+    }
+
     // MARK: - Tests
 
     func testSaveAndLoadRoundTrip() throws {

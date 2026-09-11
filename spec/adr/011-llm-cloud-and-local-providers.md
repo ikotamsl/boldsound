@@ -246,3 +246,16 @@ Historical note: this alternative has since been implemented on the current bran
 - `spec/11-llm-integration.md`: Previous integration spec (HISTORICAL)
 - Char (fastrepl/char): Meeting app with cloud + local-provider LLM support
 - Cursor, Raycast, Continue: Precedent for "bring your own API key" in developer tools
+
+### Amendment (2026-09-11): account access in AI Setup
+
+OpenAI and Google Gemini expose API key / Subscription under Current choice.
+Subscription mode runs the official Codex/Gemini CLI using saved account login;
+it never reuses OAuth tokens in HTTP requests or falls back to API billing.
+Saving requires a successful synthetic test of the current model. Existing
+API configurations retain their behavior. Other providers explain why this
+integration does not offer subscription access. The older Local CLI amendment
+is not a guarantee of subscription entitlement for arbitrary custom commands;
+Anthropic subscription login is not offered by this app integration.
+See [LLM authentication contract](../contracts/llm-authentication.md) for
+persistence, errors, model verification and Gemini CLI local history disclosure.

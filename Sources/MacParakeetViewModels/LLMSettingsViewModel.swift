@@ -156,11 +156,28 @@ public final class LLMSettingsViewModel {
     public private(set) var aiFormatterSmartDefaultsPolicy: AIFormatterSmartDefaultsPolicy
     public let inProcessModelManager: InProcessModelManagerViewModel
     private var discoveredModels: [String] = []
+    private var draftRevision = 0
 
     public var selectedProviderID: LLMProviderID? {
         get { draft.providerID }
         set { applyProviderChange(to: newValue) }
     }
+
+    public var authenticationMode: LLMAuthenticationMode {
+        get { draft.authenticationMode }
+        set {
+            guard newValue == .apiKey || draft.providerID?.supportsSubscription == true else { return }
+            var nextDraft = draft
+            nextDraft.authenticationMode = newValue
+            if newValue == .apiKey, nextDraft.apiKeyInput.isEmpty, let provider = nextDraft.providerID {
+                nextDraft.apiKeyInput = (try? configStore?.loadAPIKey(for: provider)) ?? ""
+            }
+            resetDiscoveredModels()
+            updateDraft(nextDraft)
+        }
+    }
+
+    public var usesSubscription: Bool { authenticationMode == .subscription }
 
     public var apiKeyInput: String {
         get { draft.apiKeyInput }
@@ -276,6 +293,7 @@ public final class LLMSettingsViewModel {
 
     public var availableModels: [String] {
         guard let providerID = draft.providerID else { return [] }
+        if usesSubscription { return Self.suggestedModels(for: providerID) }
         if Self.usesDiscoveredModelList(providerID) {
             return LLMModelAvailability.settingsModels(
                 for: providerID,
@@ -286,7 +304,7 @@ public final class LLMSettingsViewModel {
     }
 
     public var canRefreshModelList: Bool {
-        draft.providerID.map(Self.usesDiscoveredModelList) ?? false
+        !usesSubscription && (draft.providerID.map(Self.usesDiscoveredModelList) ?? false)
     }
 
     public var canChooseModelFromList: Bool {
@@ -317,7 +335,7 @@ public final class LLMSettingsViewModel {
 
     public var canSave: Bool {
         if draft.providerID == nil { return isConfigured }
-        return draft.isValid
+        return draft.isValid && (!usesSubscription || connectionTestState == .success)
     }
 
     public var canTestConnection: Bool {
@@ -593,7 +611,8 @@ public final class LLMSettingsViewModel {
             modelName: String,
             apiKey: String?,
             isLocal: Bool,
-            localCLIConfig: LocalCLIConfig?
+            localCLIConfig: LocalCLIConfig?,
+            authenticationMode: LLMAuthenticationMode = .apiKey
         )
     }
 
@@ -646,6 +665,10 @@ public final class LLMSettingsViewModel {
             saveState = .saved
             return
         }
+        if usesSubscription && connectionTestState != .success {
+            saveState = .error("Test the selected model with your account before saving subscription access.")
+            return
+        }
         do {
             guard let config = try buildConfig(from: draft) else { return }
             try configStore.saveConfig(config)
@@ -678,6 +701,7 @@ public final class LLMSettingsViewModel {
         guard let llmClient else { return }
 
         let snapshot = draft
+        let revision = draftRevision
         let context: LLMExecutionContext
         do {
             guard let config = try buildConfig(from: snapshot) else { return }
@@ -698,10 +722,10 @@ public final class LLMSettingsViewModel {
         Task {
             do {
                 try await llmClient.testConnection(context: context)
-                guard draft == snapshot else { return }
+                guard draft == snapshot, draftRevision == revision else { return }
                 connectionTestState = .success
             } catch {
-                guard draft == snapshot else { return }
+                guard draft == snapshot, draftRevision == revision else { return }
                 connectionTestState = .error(error.localizedDescription)
             }
         }
@@ -1115,6 +1139,7 @@ public final class LLMSettingsViewModel {
         let didChange = draft != newDraft
         draft = newDraft
         if didChange {
+            draftRevision += 1
             connectionTestState = .idle
             saveState = .idle
         }
@@ -1186,7 +1211,9 @@ public final class LLMSettingsViewModel {
     }
 
     private func buildModelListContext(from draft: LLMSettingsDraft) throws -> LLMExecutionContext? {
-        guard let providerID = draft.providerID, Self.usesDiscoveredModelList(providerID) else { return nil }
+        guard draft.authenticationMode == .apiKey, let providerID = draft.providerID,
+            Self.usesDiscoveredModelList(providerID)
+        else { return nil }
         guard
             let config = try draft.buildConfig(
                 defaultBaseURL: Self.defaultBaseURL(for: providerID),
@@ -1204,6 +1231,7 @@ public final class LLMSettingsViewModel {
 
     private func shouldApplyModelListResult(for snapshot: LLMSettingsDraft) -> Bool {
         draft.providerID == snapshot.providerID
+            && draft.authenticationMode == snapshot.authenticationMode
             && draft.trimmedAPIKey == snapshot.trimmedAPIKey
             && draft.trimmedBaseURLOverride == snapshot.trimmedBaseURLOverride
             && draft.allowInsecureLocalNetworkHTTP == snapshot.allowInsecureLocalNetworkHTTP
@@ -1279,9 +1307,10 @@ public final class LLMSettingsViewModel {
             id: providerID,
             baseURL: draftBaseURL(for: providerID),
             modelName: draft.effectiveModelName,
-            apiKey: providerID.supportsAPIKey ? draft.trimmedAPIKey : nil,
+            apiKey: draft.supportsAPIKey ? draft.trimmedAPIKey : nil,
             isLocal: draft.isLocalConfiguration,
-            localCLIConfig: nil
+            localCLIConfig: nil,
+            authenticationMode: draft.authenticationMode
         )
     }
 
@@ -1291,13 +1320,15 @@ public final class LLMSettingsViewModel {
             id: config.id,
             baseURL: config.baseURL.absoluteString,
             modelName: config.modelName,
-            apiKey: config.id.supportsAPIKey ? (config.apiKey ?? "") : nil,
+            apiKey: config.authenticationMode == .apiKey && config.id.supportsAPIKey ? (config.apiKey ?? "") : nil,
             isLocal: config.isLocal,
-            localCLIConfig: config.id == .localCLI ? cliConfigStore?.load() : nil
+            localCLIConfig: config.id == .localCLI ? cliConfigStore?.load() : nil,
+            authenticationMode: config.authenticationMode
         )
     }
 
     private func draftBaseURL(for providerID: LLMProviderID) -> String {
+        if usesSubscription { return Self.defaultBaseURL(for: providerID) }
         let override = draft.trimmedBaseURLOverride
         guard !override.isEmpty else {
             return Self.defaultBaseURL(for: providerID)

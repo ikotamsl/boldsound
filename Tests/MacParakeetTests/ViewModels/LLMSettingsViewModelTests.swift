@@ -448,7 +448,9 @@ final class LLMSettingsViewModelTests: XCTestCase {
 
     func testClearResetsAIFormatterPreferences() {
         defaults.set(true, forKey: UserDefaultsAppRuntimePreferences.aiFormatterEnabledKey)
-        defaults.set("Rewrite:\n\(AIFormatter.transcriptPlaceholder)", forKey: UserDefaultsAppRuntimePreferences.aiFormatterPromptKey)
+        defaults.set(
+            "Rewrite:\n\(AIFormatter.transcriptPlaceholder)",
+            forKey: UserDefaultsAppRuntimePreferences.aiFormatterPromptKey)
         mockConfigStore.config = .openai(apiKey: "sk-test")
         viewModel.configure(configStore: mockConfigStore, llmClient: mockClient)
 
@@ -568,7 +570,8 @@ final class LLMSettingsViewModelTests: XCTestCase {
     func testChangingCategoryProfileDraftPreservesCustomNameAndPrompt() {
         viewModel.startCreatingAIFormatterProfile(targetKind: .category)
         viewModel.updateAIFormatterProfileDraft(\.name, to: "My Messages")
-        viewModel.updateAIFormatterProfileDraft(\.promptTemplate, to: "Custom prompt \(AIFormatter.transcriptPlaceholder)")
+        viewModel.updateAIFormatterProfileDraft(
+            \.promptTemplate, to: "Custom prompt \(AIFormatter.transcriptPlaceholder)")
 
         viewModel.applyAIFormatterProfileDraftCategory(.email)
 
@@ -868,24 +871,27 @@ final class LLMSettingsViewModelTests: XCTestCase {
     func testProfilesAreListedInMatchPrecedenceOrder() throws {
         let dbManager = try DatabaseManager()
         let repo = AIFormatterProfileRepository(dbQueue: dbManager.dbQueue)
-        try repo.save(AIFormatterProfile.exactApp(
-            name: "zoom",
-            bundleIdentifier: "us.zoom.xos",
-            promptTemplate: "p",
-            sortOrder: 1
-        ))
-        try repo.save(AIFormatterProfile.exactApp(
-            name: "Apple Mail",
-            bundleIdentifier: "com.apple.mail",
-            promptTemplate: "p",
-            sortOrder: 1
-        ))
-        try repo.save(AIFormatterProfile.category(
-            name: "browser",
-            appCategory: .browser,
-            promptTemplate: "p",
-            sortOrder: 0
-        ))
+        try repo.save(
+            AIFormatterProfile.exactApp(
+                name: "zoom",
+                bundleIdentifier: "us.zoom.xos",
+                promptTemplate: "p",
+                sortOrder: 1
+            ))
+        try repo.save(
+            AIFormatterProfile.exactApp(
+                name: "Apple Mail",
+                bundleIdentifier: "com.apple.mail",
+                promptTemplate: "p",
+                sortOrder: 1
+            ))
+        try repo.save(
+            AIFormatterProfile.category(
+                name: "browser",
+                appCategory: .browser,
+                promptTemplate: "p",
+                sortOrder: 0
+            ))
 
         viewModel.configure(
             configStore: mockConfigStore,
@@ -924,11 +930,12 @@ final class LLMSettingsViewModelTests: XCTestCase {
     func testDuplicateAIFormatterProfileSurfacesErrorAndKeepsDraft() throws {
         let dbManager = try DatabaseManager()
         let repo = AIFormatterProfileRepository(dbQueue: dbManager.dbQueue)
-        try repo.save(AIFormatterProfile.category(
-            name: "Email",
-            appCategory: .email,
-            promptTemplate: "Email prompt"
-        ))
+        try repo.save(
+            AIFormatterProfile.category(
+                name: "Email",
+                appCategory: .email,
+                promptTemplate: "Email prompt"
+            ))
         viewModel.configure(
             configStore: mockConfigStore,
             llmClient: mockClient,
@@ -972,6 +979,30 @@ final class LLMSettingsViewModelTests: XCTestCase {
     }
 
     // MARK: - Test Connection
+
+    func testSubscriptionRequiresSuccessfulSelectedModelTestBeforeSave() async throws {
+        viewModel.configure(configStore: mockConfigStore, llmClient: mockClient)
+        viewModel.selectedProviderID = .openai
+        viewModel.authenticationMode = .subscription
+        XCTAssertFalse(viewModel.supportsAPIKey)
+        XCTAssertFalse(viewModel.canRefreshModelList)
+        XCTAssertFalse(viewModel.canSave)
+        viewModel.saveConfiguration()
+        XCTAssertNil(mockConfigStore.config)
+        viewModel.testConnection()
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(mockClient.capturedContext?.providerConfig.authenticationMode, .subscription)
+        XCTAssertTrue(viewModel.canSave)
+        viewModel.saveConfiguration()
+        XCTAssertEqual(mockConfigStore.config?.authenticationMode, .subscription)
+        XCTAssertFalse(viewModel.hasUnsavedChanges)
+        viewModel.modelName = "another-model"
+        XCTAssertFalse(viewModel.canSave)
+        viewModel.selectedProviderID = .anthropic
+        XCTAssertEqual(viewModel.authenticationMode, .apiKey)
+        viewModel.authenticationMode = .subscription
+        XCTAssertEqual(viewModel.authenticationMode, .apiKey)
+    }
 
     func testConnectionSuccess() async throws {
         viewModel.configure(configStore: mockConfigStore, llmClient: mockClient)
@@ -1027,6 +1058,41 @@ final class LLMSettingsViewModelTests: XCTestCase {
         } else {
             XCTFail("Expected error state, got \(viewModel.connectionTestState)")
         }
+    }
+
+    func testSubscriptionFailurePreventsSaveAndStaleSuccessCannotValidateRevertedDraft() async throws {
+        viewModel.configure(configStore: mockConfigStore, llmClient: mockClient)
+        viewModel.selectedProviderID = .openai
+        viewModel.authenticationMode = .subscription
+        mockClient.testConnectionError = LLMError.authenticationFailed(nil)
+        viewModel.testConnection()
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertFalse(viewModel.canSave)
+        mockClient.testConnectionError = nil
+        mockClient.testConnectionDelayNs = 200_000_000
+        let model = viewModel.modelName
+        viewModel.testConnection()
+        viewModel.modelName = "other"
+        viewModel.modelName = model
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(viewModel.connectionTestState, .idle)
+        XCTAssertFalse(viewModel.canSave)
+    }
+
+    func testReopeningSubscriptionCanRestorePreservedAPIKey() throws {
+        let store = LLMConfigStore(defaults: defaults, keychain: InMemoryKeyValueStore())
+        try store.saveConfig(.openai(apiKey: "saved-key"))
+        try store.saveConfig(
+            LLMProviderConfig(
+                id: .openai, baseURL: URL(string: LLMProviderID.openai.defaultBaseURL)!, apiKey: nil,
+                modelName: "chosen", isLocal: false, authenticationMode: .subscription))
+        viewModel.configure(configStore: store, llmClient: mockClient)
+        XCTAssertEqual(viewModel.authenticationMode, .subscription)
+        XCTAssertEqual(viewModel.apiKeyInput, "")
+        XCTAssertFalse(viewModel.hasUnsavedChanges)
+        viewModel.authenticationMode = .apiKey
+        XCTAssertEqual(viewModel.apiKeyInput, "saved-key")
+        XCTAssertTrue(viewModel.hasUnsavedChanges)
     }
 
     func testStaleConnectionSuccessIsIgnoredAfterFieldChange() async throws {
@@ -1407,7 +1473,9 @@ final class LLMSettingsViewModelTests: XCTestCase {
 
     func testLoadsStoredAIFormatterPreferences() {
         defaults.set(true, forKey: UserDefaultsAppRuntimePreferences.aiFormatterEnabledKey)
-        defaults.set("Rewrite:\n\(AIFormatter.transcriptPlaceholder)", forKey: UserDefaultsAppRuntimePreferences.aiFormatterPromptKey)
+        defaults.set(
+            "Rewrite:\n\(AIFormatter.transcriptPlaceholder)",
+            forKey: UserDefaultsAppRuntimePreferences.aiFormatterPromptKey)
         mockConfigStore.config = .openai(apiKey: "sk-test")
 
         viewModel.configure(configStore: mockConfigStore, llmClient: mockClient)
@@ -1418,7 +1486,8 @@ final class LLMSettingsViewModelTests: XCTestCase {
     }
 
     func testLoadsLegacyDefaultAIFormatterPromptAsUpdatedDefault() {
-        defaults.set(AIFormatter.legacyDefaultPromptTemplateV1, forKey: UserDefaultsAppRuntimePreferences.aiFormatterPromptKey)
+        defaults.set(
+            AIFormatter.legacyDefaultPromptTemplateV1, forKey: UserDefaultsAppRuntimePreferences.aiFormatterPromptKey)
         mockConfigStore.config = .openai(apiKey: "sk-test")
 
         viewModel.configure(configStore: mockConfigStore, llmClient: mockClient)
